@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from jasna.accelerator import is_amd_device, is_nvidia_device
+from jasna.accelerator import is_amd_device, is_apple_device, is_nvidia_device
 from jasna.engine_paths import get_onnx_tensorrt_engine_path, get_yolo_tensorrt_engine_path, model_weights_dir
 from jasna.session_config import DEFAULT_DETECTION_MODEL_NAME
 
@@ -97,10 +97,10 @@ _RFDETR_PATTERN = re.compile(r"^rfdetr-.+$")
 
 
 def rfdetr_weights_suffix() -> str:
-    """AMD runs RF-DETR from the trained torch checkpoint (``.pt``); NVIDIA
-    compiles the ONNX export to TensorRT (``.onnx``). Resolved from the active
+    """AMD and Apple Silicon run RF-DETR from the trained torch checkpoint (``.pt``);
+    NVIDIA compiles the ONNX export to TensorRT (``.onnx``). Resolved from the active
     accelerator vendor — release binaries are vendor-specific."""
-    return ".pt" if is_amd_device() else ".onnx"
+    return ".pt" if (is_amd_device() or is_apple_device()) else ".onnx"
 
 
 def is_rfdetr_model(name: str) -> bool:

@@ -30,7 +30,15 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from jasna.accelerator import KernelBackend, amd_gpu_architecture, has_triton, is_amd_device, kernel_backend
+from jasna.accelerator import (
+    KernelBackend,
+    amd_gpu_architecture,
+    has_triton,
+    is_amd_device,
+    is_apple_device,
+    kernel_backend,
+)
+from jasna.ltx.mps_kernels import RotatedActivation
 from jasna.tensor_utils import half_dtype
 
 Weights = Mapping[str, torch.Tensor]
@@ -107,12 +115,17 @@ def quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def int8_linear(
-    x: torch.Tensor, qdata: torch.Tensor, scales: torch.Tensor, bias: torch.Tensor | None
+    x: torch.Tensor | RotatedActivation, qdata: torch.Tensor, scales: torch.Tensor, bias: torch.Tensor | None
 ) -> torch.Tensor:
-    """ConvRot W8A8: rotate, quantize per token, INT8 tensor-core GEMM, rescale. With the
+    """ConvRot W8A8 (CUDA/ROCm) or W8A16 (Apple MPS Metal): rotate, GEMM, rescale. With the
     Triton kernels on, one fused quantize pass and one GEMM with the rescale in its epilogue;
+    on Apple MPS, custom Metal Hadamard-256 + vectorized INT8->BF16 dequant + BF16 GEMM;
     otherwise rows run in chunks of ``CHUNK_ROWS`` (every step is per row, so chunking only
     caps the fp32/int32 temporaries)."""
+    if isinstance(x, RotatedActivation) or x.device.type == "mps":
+        from jasna.ltx import mps_kernels
+
+        return mps_kernels.int8_linear_mps(x, qdata, scales, bias)
     out_features, in_features = qdata.shape
     flat = x.reshape(-1, in_features)
     if _quant_kernels is not None and x.is_cuda:
@@ -222,8 +235,13 @@ def nvfp4_linear(
 
 
 def gelu_linear(w: Weights, name: str, h: torch.Tensor) -> torch.Tensor:
-    """``linear(w, name, gelu_tanh(h))``; the NVFP4 kernels quantize straight from ``h``."""
+    """``linear(w, name, gelu_tanh(h))``; the NVFP4 kernels quantize straight from ``h``,
+    and Apple MPS fuses GELU + Hadamard-256 before its W8A16 GEMM."""
     weight = w.get(f"{name}.weight")
+    if h.device.type == "mps" and weight is None:
+        from jasna.ltx import mps_kernels
+
+        return mps_kernels.gelu_int8_linear_mps(h, w[f"{name}.qdata"], w[f"{name}.scales"], w.get(f"{name}.bias"))
     if _quant_kernels is not None and h.is_cuda and weight is not None and weight.dtype == torch.uint8:
         flat = h.reshape(-1, weight.shape[1] * 2)
         act_scale = fp4_tensor_scale(F.gelu(flat, approximate="tanh"))
@@ -261,18 +279,22 @@ def quantize_fp4_activation(x: torch.Tensor) -> Fp4Activation:
 
 
 def _shared_fp4_input(
-    w: Weights, name: str, x: torch.Tensor | QuantizedRows
-) -> torch.Tensor | QuantizedRows | Fp4Activation:
+    w: Weights, name: str, x: torch.Tensor | QuantizedRows | RotatedActivation
+) -> torch.Tensor | QuantizedRows | RotatedActivation | Fp4Activation:
     """``x`` quantized once for the linears that read it when ``name`` is NVFP4 on the Triton
     kernels, else ``x``."""
     weight = w.get(f"{name}.weight")
-    if isinstance(x, QuantizedRows) or _quant_kernels is None or not x.is_cuda:
+    if isinstance(x, (QuantizedRows, RotatedActivation)) or _quant_kernels is None or not x.is_cuda:
         return x
     return quantize_fp4_activation(x) if weight is not None and weight.dtype == torch.uint8 else x
 
 
-def linear(w: Weights, name: str, x: torch.Tensor | QuantizedRows | Fp4Activation) -> torch.Tensor:
+def linear(w: Weights, name: str, x: torch.Tensor | QuantizedRows | RotatedActivation | Fp4Activation) -> torch.Tensor:
     bias = w.get(f"{name}.bias")
+    if isinstance(x, RotatedActivation):
+        from jasna.ltx import mps_kernels
+
+        return mps_kernels.int8_linear_mps(x, w[f"{name}.qdata"], w[f"{name}.scales"], bias)
     if isinstance(x, QuantizedRows):
         return _quant_kernels.int8_scaled_mm(x.codes, x.scales, w[f"{name}.qdata"], w[f"{name}.scales"], bias)[None]
     if isinstance(x, Fp4Activation):
@@ -295,9 +317,14 @@ _kitchen_int8_linear = None
 def enable_quant_kernels(device: torch.device) -> str | None:
     """Route the INT8 and NVFP4 linears through fused kernels: the Triton kernels of ``kernels.py``
     on the GPU architectures ``kernel_policy.supports``, as opaque ops so they compile as calls (an INT8
-    block also fuses its norms, AdaLN modulation and feed-forward residual into them); else on AMD
-    comfy-kitchen's ConvRot INT8 linear (Windows ROCm has no Triton). Returns the kernels in use."""
+    block also fuses its norms, AdaLN modulation and feed-forward residual into them); on Apple MPS,
+    custom Metal shaders for W8A16 ConvRot; else on AMD comfy-kitchen's ConvRot INT8 linear (Windows
+    ROCm has no Triton). Returns the kernels in use."""
     global _quant_kernels, _kitchen_int8_linear
+    if device.type == "mps":
+        from jasna.ltx import mps_kernels
+
+        return "Metal (MPS)" if mps_kernels.is_available() else "MPS"
     if _quant_kernels is None and _kitchen_int8_linear is None and device.type == "cuda":
         amd = is_amd_device(device)
         if kernel_backend(device) is not KernelBackend.AMD_PREBUILT and has_triton():
@@ -425,7 +452,15 @@ def _triton_ops(kernels, attention_epilogues: bool) -> SimpleNamespace:
 def require_kernels(device: torch.device) -> None:
     """Fail unless Triton (NVIDIA; AMD without it runs comfy-kitchen and prebuilt kernels) and
     comfy-kitchen's INT8 attention can run on ``device``: without them every LTX pass would run on
-    far slower fallbacks."""
+    far slower fallbacks. On Apple Silicon (MPS), Metal shader compilation is required instead."""
+    if device.type == "mps":
+        from jasna.ltx import mps_kernels
+
+        if not mps_kernels.is_available():
+            raise RuntimeError(
+                "LTX restoration on macOS requires Apple Silicon with PyTorch MPS Metal shader support."
+            )
+        return
     amd = is_amd_device(device)
     if not amd and not has_triton():
         raise RuntimeError("LTX restoration needs triton, which is missing from this install. Reinstall Jasna.")
@@ -456,6 +491,8 @@ def enable_int8_attention(device: torch.device) -> None:
     """Route CUDA video self-attention, and the prompt cross-attention where
     ``kernel_policy.int8_cross_attention``, through comfy-kitchen's INT8 attention (an opaque op, so
     it compiles as one call); ``require_kernels`` checks that it can run."""
+    if device.type != "cuda":
+        return
     from jasna.ltx import kernel_policy
 
     global _int8_attention, _int8_cross_attention
@@ -472,7 +509,10 @@ def enable_int8_attention(device: torch.device) -> None:
 
 
 def self_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Video self-attention ``[1, heads, tokens, d]``: INT8 attention once enabled."""
+    """Video self-attention ``[1, heads, tokens, d]``: INT8 attention once enabled on CUDA,
+    native Metal SDPA on Apple MPS."""
+    if q.device.type == "mps":
+        return F.scaled_dot_product_attention(q, k, v)
     if _int8_attention is not None and q.is_cuda:
         return _int8_attention(q, k, v)
     with sdpa_kernel(SDPA_PRIORITY, set_priority=True):
@@ -482,6 +522,8 @@ def self_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.T
 def cross_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Prompt cross-attention ``[1, heads, tokens, d]`` against ``[1, heads, prompt, d]``: INT8 attention
     once enabled where ``kernel_policy.int8_cross_attention``, else SDPA."""
+    if q.device.type == "mps":
+        return F.scaled_dot_product_attention(q, k, v)
     if _int8_attention is not None and _int8_cross_attention and q.is_cuda:
         return _int8_attention(q, k, v)
     with sdpa_kernel(SDPA_PRIORITY, set_priority=True):
@@ -489,6 +531,8 @@ def cross_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor | None = None) -> torch.Tensor:
+    if weight is not None and weight.dtype != x.dtype:
+        weight = weight.to(x.dtype)
     return F.rms_norm(x, (x.shape[-1],), weight=weight, eps=EPS)
 
 
@@ -538,15 +582,16 @@ def build_rope(frames: int, height: int, width: int, *, dim: int, heads: int, de
     tokens = cos.shape[1]
     cos = cos.reshape(1, tokens, heads, -1).swapaxes(1, 2)
     sin = sin.reshape(1, tokens, heads, -1).swapaxes(1, 2)
-    return Rope(cos=cos.to(device=device, dtype=torch.bfloat16), sin=sin.to(device=device, dtype=torch.bfloat16))
+    rope_dtype = half_dtype(device) if device.type == "mps" else torch.bfloat16
+    return Rope(cos=cos.to(device=device, dtype=rope_dtype), sin=sin.to(device=device, dtype=rope_dtype))
 
 
 def _apply_rope(x: torch.Tensor, rope: Rope, heads: int) -> torch.Tensor:
     """``x`` ``[1, 2n, heads*d]`` -> ``[1, heads, 2n, d]`` rotated (split halves)."""
     n = rope.cos.shape[2]
     halves = x.unflatten(-1, (heads, 2, -1)).transpose(1, 2).unflatten(2, (2, n))  # [1,H,2,n,2,d/2]
-    cos = rope.cos[:, :, None, :, None, :]
-    sin = rope.sin[:, :, None, :, None, :]
+    cos = (rope.cos if rope.cos.dtype == x.dtype else rope.cos.to(x.dtype))[:, :, None, :, None, :]
+    sin = (rope.sin if rope.sin.dtype == x.dtype else rope.sin.to(x.dtype))[:, :, None, :, None, :]
     out = halves * cos
     out[..., :1, :].addcmul_(-sin, halves[..., 1:, :])
     out[..., 1:, :].addcmul_(sin, halves[..., :1, :])
@@ -610,17 +655,24 @@ def _heads(x: torch.Tensor, heads: int) -> torch.Tensor:
     return x.unflatten(-1, (heads, -1)).transpose(1, 2)
 
 
-def _gated(w: Weights, prefix: str, x: torch.Tensor | QuantizedRows, out: torch.Tensor, heads: int) -> torch.Tensor:
+def _gated(
+    w: Weights, prefix: str, x: torch.Tensor | QuantizedRows | RotatedActivation, out: torch.Tensor, heads: int
+) -> torch.Tensor:
     """Attention output ``[1, tokens, D]`` times the per-head gates read from ``x``."""
     gates = 2.0 * torch.sigmoid(linear(w, f"{prefix}.to_gate_logits", x))
     return (out.unflatten(-1, (heads, -1)) * gates.unsqueeze(-1)).flatten(2)
 
 
 def _gated_heads(
-    w: Weights, prefix: str, x: torch.Tensor | QuantizedRows, out: torch.Tensor, heads: int
-) -> torch.Tensor | QuantizedRows:
-    """``_gated`` of attention output heads ``[1, heads, tokens, d]``, quantized for the output
+    w: Weights, prefix: str, x: torch.Tensor | QuantizedRows | RotatedActivation, out: torch.Tensor, heads: int
+) -> torch.Tensor | QuantizedRows | RotatedActivation:
+    """``_gated`` of attention output heads ``[1, heads, tokens, d]``, quantized/rotated for the output
     projection when the attention epilogues are fused."""
+    if isinstance(x, RotatedActivation):
+        from jasna.ltx import mps_kernels
+
+        logits = linear(w, f"{prefix}.to_gate_logits", x)
+        return mps_kernels.gated_heads_rotate(out[0], logits[0])
     if isinstance(x, QuantizedRows) and _quant_kernels.attention_epilogues:
         logits = linear(w, f"{prefix}.to_gate_logits", x)
         return QuantizedRows(*_quant_kernels.int8_gated_rotate_quantize(out[0], logits[0]))
@@ -628,7 +680,11 @@ def _gated_heads(
 
 
 def _residual_linear(
-    w: Weights, name: str, x: torch.Tensor | QuantizedRows, residual: torch.Tensor, gate: torch.Tensor
+    w: Weights,
+    name: str,
+    x: torch.Tensor | QuantizedRows | RotatedActivation,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
 ) -> torch.Tensor:
     """``residual + _gate(linear(w, name, x), gate)``, in the GEMM epilogue for quantized ``x`` when the
     attention epilogues are fused."""
@@ -636,12 +692,15 @@ def _residual_linear(
         return _quant_kernels.int8_residual_mm(
             x.codes, x.scales, w[f"{name}.qdata"], w[f"{name}.scales"], w.get(f"{name}.bias"), residual[0], gate[0],
         )[None]
-    return residual + _gate(linear(w, name, x), gate)
+    out = linear(w, name, x)
+    if out.dtype != residual.dtype:
+        out = out.to(residual.dtype)
+    return residual + _gate(out, gate)
 
 
 def _self_attention(
-    w: Weights, x: torch.Tensor | QuantizedRows, rope: Rope, heads: int, *, skip: bool
-) -> torch.Tensor | QuantizedRows:
+    w: Weights, x: torch.Tensor | QuantizedRows | RotatedActivation, rope: Rope, heads: int, *, skip: bool
+) -> torch.Tensor | QuantizedRows | RotatedActivation:
     """Gated video self-attention output before its ``to_out.0`` projection; NVFP4 Q/K/V
     projections share one quantization of ``x``."""
     qkv_in = _shared_fp4_input(w, "attn1.to_v", x)
@@ -663,6 +722,12 @@ def prompt_key_value(
     prompt = context * (1 + kv[:, :, 1]) + kv[:, :, 0]
     if _quant_kernels is not None and context.is_cuda and "ff.net.2.qdata" in w:
         prompt = QuantizedRows(*_quant_kernels.int8_rotate_quantize(prompt[0]))
+    elif context.device.type == "mps" and "ff.net.2.qdata" in w:
+        from jasna.ltx import mps_kernels
+
+        prompt = RotatedActivation(
+            mps_kernels.hadamard_256(prompt[0], out_dtype=half_dtype(context.device)), prompt.shape[:-1]
+        )
     prompt = _shared_fp4_input(w, "attn2.to_v", prompt)
     key = rms_norm(linear(w, "attn2.to_k", prompt), w["attn2.k_norm.weight"])
     dtype = half_dtype(context.device)
@@ -670,8 +735,11 @@ def prompt_key_value(
 
 
 def _cross_attention(
-    w: Weights, x: torch.Tensor | QuantizedRows, prompt: tuple[torch.Tensor, torch.Tensor], heads: int
-) -> torch.Tensor | QuantizedRows:
+    w: Weights,
+    x: torch.Tensor | QuantizedRows | RotatedActivation,
+    prompt: tuple[torch.Tensor, torch.Tensor],
+    heads: int,
+) -> torch.Tensor | QuantizedRows | RotatedActivation:
     """Gated prompt cross-attention output before its ``to_out.0`` projection, computed in the
     prompt key/value dtype."""
     q = rms_norm(linear(w, "attn2.to_q", x), w["attn2.q_norm.weight"])
@@ -694,13 +762,14 @@ def block_forward(
     the block's ``prompt_key_value`` for this step."""
     ada = w["scale_shift_table"][None, None] + cond.block_rows  # [1, 2, 9, D]
     fused = _quant_kernels is not None and x.is_cuda and "ff.net.2.qdata" in w
-    attn_in = _modulated(x, ada[:, :, 0], ada[:, :, 1], fused)
+    mps_fused = x.device.type == "mps" and "ff.net.2.qdata" in w
+    attn_in = _modulated(x, ada[:, :, 0], ada[:, :, 1], fused, mps_fused)
     attn_out = _self_attention(w, attn_in, rope, heads, skip=skip_self_attention)
     x = _residual_linear(w, "attn1.to_out.0", attn_out, x, ada[:, :, 2])
-    query = _modulated(x, ada[:, :, 6], ada[:, :, 7], fused)
+    query = _modulated(x, ada[:, :, 6], ada[:, :, 7], fused, mps_fused)
     attn_out = _cross_attention(w, query, prompt, heads)
     x = _residual_linear(w, "attn2.to_out.0", attn_out, x, ada[:, :, 8])
-    ff_in = _modulated(x, ada[:, :, 3], ada[:, :, 4], fused)
+    ff_in = _modulated(x, ada[:, :, 3], ada[:, :, 4], fused, mps_fused)
     if fused:
         return _quant_kernels.int8_feed_forward(
             ff_in.codes,
@@ -714,6 +783,21 @@ def block_forward(
             x[0],
             ada[0, :, 5],
         )[None]
+    if mps_fused:
+        from jasna.ltx import mps_kernels
+
+        return mps_kernels.feed_forward_mps(
+            ff_in,
+            w["ff.net.0.proj.qdata"],
+            w["ff.net.0.proj.scales"],
+            w.get("ff.net.0.proj.bias"),
+            w["ff.net.2.qdata"],
+            w["ff.net.2.scales"],
+            w.get("ff.net.2.bias"),
+            x,
+            ada[:, :, 5],
+            CHUNK_ROWS,
+        )
     ff_out = torch.empty_like(ff_in)
     for start in range(0, ff_in.shape[1], CHUNK_ROWS):
         hidden = linear(w, "ff.net.0.proj", ff_in[:, start : start + CHUNK_ROWS])
@@ -722,11 +806,15 @@ def block_forward(
 
 
 def _modulated(
-    x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, fused: bool
-) -> torch.Tensor | QuantizedRows:
-    """``_modulate(rms_norm(x), shift, scale)``, or its int8 codes computed straight from ``x``."""
+    x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, fused: bool, mps_fused: bool = False
+) -> torch.Tensor | QuantizedRows | RotatedActivation:
+    """``_modulate(rms_norm(x), shift, scale)``, or its int8/rotated form computed straight from ``x``."""
     if fused:
         return QuantizedRows(*_quant_kernels.int8_modulate_rotate_quantize(x[0], shift[0], scale[0]))
+    if mps_fused:
+        from jasna.ltx import mps_kernels
+
+        return mps_kernels.modulate_rotate(x, shift, scale, out_dtype=half_dtype(x.device))
     return _modulate(rms_norm(x), shift, scale)
 
 

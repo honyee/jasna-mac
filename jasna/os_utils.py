@@ -77,6 +77,14 @@ _COMMON_EXECUTABLE_LOCATIONS: dict[str, tuple[str, ...]] = {
         "/usr/local/nvidia/bin/nvidia-smi",
         "/usr/lib/wsl/lib/nvidia-smi",
     ),
+    "ffprobe": (
+        "/opt/homebrew/bin/ffprobe",
+        "/usr/local/bin/ffprobe",
+    ),
+    "ffmpeg": (
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+    ),
 }
 
 

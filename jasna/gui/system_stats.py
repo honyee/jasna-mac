@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from pathlib import Path
 import subprocess
+import sys
 import threading
 
 from jasna import os_utils
@@ -62,10 +63,33 @@ def _read_amd_sysfs() -> tuple[int | None, int | None]:
     return None, None
 
 
+def _read_apple_mps() -> tuple[int | None, int | None]:
+    torch_mod = sys.modules.get("torch")
+    if torch_mod is None or not hasattr(torch_mod, "mps"):
+        return None, None
+    try:
+        if not torch_mod.backends.mps.is_available():
+            return None, None
+        total = int(torch_mod.mps.recommended_max_memory())
+        if total <= 0:
+            return None, None
+        if int(torch_mod.mps.current_allocated_memory()) <= 0:
+            return None, None
+        used = int(torch_mod.mps.driver_allocated_memory())
+        return None, _clamp_pct((used / total) * 100.0)
+    except Exception:
+        return None, None
+
+
 def read_gpu_vram() -> tuple[int | None, int | None]:
     exe_path = os_utils.find_executable("nvidia-smi")
     if exe_path is None:
-        return _read_amd_sysfs()
+        gpu_util, vram_util = _read_amd_sysfs()
+        if gpu_util is not None or vram_util is not None:
+            return gpu_util, vram_util
+        if sys.platform == "darwin":
+            return _read_apple_mps()
+        return None, None
 
     cmd = [
         exe_path,

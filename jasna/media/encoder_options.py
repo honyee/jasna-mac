@@ -88,6 +88,28 @@ def _amf_default_options(codec: str, **codec_options: str) -> dict[str, str]:
 
 NVENC_SMART_FRAGMENT_OPTIONS = MappingProxyType({"forced-idr": "1"})
 AMF_SMART_FRAGMENT_OPTIONS = MappingProxyType({"forced_idr": "1"})
+APPLE_SMART_FRAGMENT_OPTIONS: Mapping[str, str] = MappingProxyType({})
+
+_FF_QP2LAMBDA = 118
+
+
+def videotoolbox_global_quality(cq: float) -> str:
+    """Map Jasna's portable CQ (1..51, lower = higher quality) to VideoToolbox's
+    ``global_quality`` (``q * FF_QP2LAMBDA`` where ``q`` is 1..100, higher = higher quality)."""
+    quality = max(1, min(100, round(100.0 - float(cq) * 1.5)))
+    return str(quality * _FF_QP2LAMBDA)
+
+
+def _videotoolbox_default_options(codec: str, *, profile: str) -> dict[str, str]:
+    return {
+        "profile": profile,
+        "g": "250",
+        "allow_sw": "1",
+        "realtime": "0",
+        "spatial_aq": "1",
+        "global_quality": videotoolbox_global_quality(encoder_cq_spec(codec, AcceleratorVendor.APPLE).default),
+    }
+
 
 _FRAME_FORMATS = {"hevc": "p010le", "h264": "nv12", "av1": "p010le"}
 
@@ -95,12 +117,12 @@ _FRAME_FORMATS = {"hevc": "p010le", "h264": "nv12", "av1": "p010le"}
 @dataclass(frozen=True)
 class EncoderSpec:
     encoder_name: str
-    frame_format: str  # PyAV hardware-frame software format: "nv12" or "p010le"
+    frame_format: str  # PyAV frame software format: "nv12", "p010le", "yuv420p", or "yuv420p10le"
     default_options: Mapping[str, str]
 
     @property
     def ten_bit(self) -> bool:
-        return self.frame_format == "p010le"
+        return self.frame_format in ("p010le", "yuv420p10le")
 
 
 def _encoder_specs(backend: str, default_options: dict[str, dict[str, str]]) -> dict[str, EncoderSpec]:
@@ -121,6 +143,28 @@ AMF_ENCODER_SPECS: dict[str, EncoderSpec] = _encoder_specs("amf", {
     "h264": _amf_default_options("h264", vbaq="0", profile="high"),
     "av1": _amf_default_options("av1", aq_mode="none", profile="main", bitdepth="10"),
 })
+
+APPLE_ENCODER_SPECS: dict[str, EncoderSpec] = {
+    "hevc": EncoderSpec(
+        "hevc_videotoolbox",
+        "p010le",
+        MappingProxyType(_videotoolbox_default_options("hevc", profile="main10")),
+    ),
+    "h264": EncoderSpec(
+        "h264_videotoolbox",
+        "nv12",
+        MappingProxyType(_videotoolbox_default_options("h264", profile="high")),
+    ),
+    "av1": EncoderSpec(
+        "libsvtav1",
+        "yuv420p10le",
+        MappingProxyType({
+            "preset": "8",
+            "crf": str(encoder_cq_spec("av1", AcceleratorVendor.APPLE).default),
+            "g": "250",
+        }),
+    ),
+}
 
 NVENC_MAX_SURFACES = 64
 LARGE_FRAME_PIXELS = 4096 * 2160
@@ -280,7 +324,24 @@ def _eight_bit_spec(spec: EncoderSpec, codec: str) -> EncoderSpec:
     # AMF pins output depth via "bitdepth"; dropping it lets FFmpeg
     # derive 8-bit from the nv12 input instead of conflicting with it.
     options.pop("bitdepth", None)
-    return replace(spec, frame_format="nv12", default_options=MappingProxyType(options))
+    eight_bit_format = "yuv420p" if spec.frame_format == "yuv420p10le" else "nv12"
+    return replace(spec, frame_format=eight_bit_format, default_options=MappingProxyType(options))
+
+
+def _normalize_apple_overrides(codec: str, overrides: dict[str, str]) -> None:
+    if "cq" in overrides:
+        cq = float(overrides.pop("cq"))
+        if codec == "av1":
+            overrides["crf"] = str(int(round(cq)))
+        else:
+            overrides["global_quality"] = videotoolbox_global_quality(cq)
+    if codec == "av1":
+        # libsvtav1 caps bitrate via svtav1-params mbr=<kbps> rather than AVCodecContext maxrate/bufsize.
+        maxrate = overrides.pop("maxrate", None)
+        overrides.pop("bufsize", None)
+        if maxrate is not None and "svtav1-params" not in overrides:
+            kbps = max(1, int(maxrate) // 1000)
+            overrides["svtav1-params"] = f"mbr={kbps}"
 
 
 def resolve_encoder_options(
@@ -293,7 +354,12 @@ def resolve_encoder_options(
     frame_generation: bool = False,
 ) -> tuple[EncoderSpec, dict[str, str]]:
     """Pick the encoder spec and the final FFmpeg options for one output."""
-    specs = AMF_ENCODER_SPECS if vendor is AcceleratorVendor.AMD else ENCODER_SPECS
+    if vendor is AcceleratorVendor.AMD:
+        specs = AMF_ENCODER_SPECS
+    elif vendor is AcceleratorVendor.APPLE:
+        specs = APPLE_ENCODER_SPECS
+    else:
+        specs = ENCODER_SPECS
     if codec not in specs:
         raise ValueError(f"Unsupported codec: {codec}")
     spec = specs[codec]
@@ -317,6 +383,8 @@ def resolve_encoder_options(
             overrides["spatial_aq"] = overrides.pop("spatial-aq")
         if vendor is AcceleratorVendor.AMD:
             _normalize_amf_cq(codec, overrides, encoder_options, ten_bit=spec.ten_bit)
+        elif vendor is AcceleratorVendor.APPLE:
+            _normalize_apple_overrides(codec, overrides)
         else:
             _drop_unsupported_nvenc_overrides(codec, overrides, encoder_options)
     uses_amf_cqp = (
@@ -324,9 +392,13 @@ def resolve_encoder_options(
         and overrides.get("rc", encoder_options["rc"]) in {"cqp", "0"}
     )
     if "maxrate" not in overrides and not uses_amf_cqp:
-        encoder_options.update(
-            source_bitrate_cap_options(metadata, output_codec=codec, vendor=vendor, frame_generation=frame_generation)
-        )
+        cap = source_bitrate_cap_options(metadata, output_codec=codec, vendor=vendor, frame_generation=frame_generation)
+        if vendor is AcceleratorVendor.APPLE and codec == "av1":
+            if "maxrate" in cap and "svtav1-params" not in overrides:
+                kbps = max(1, int(cap["maxrate"]) // 1000)
+                encoder_options["svtav1-params"] = f"mbr={kbps}"
+        else:
+            encoder_options.update(cap)
     encoder_options.update(overrides)
     if (
         vendor is AcceleratorVendor.NVIDIA
@@ -335,7 +407,10 @@ def resolve_encoder_options(
     ):
         encoder_options["rc-lookahead"] = str(lookahead_within_b_frame_surfaces(int(encoder_options["bf"])))
     if smart_fragment:
-        encoder_options.update(
-            AMF_SMART_FRAGMENT_OPTIONS if vendor is AcceleratorVendor.AMD else NVENC_SMART_FRAGMENT_OPTIONS
-        )
+        if vendor is AcceleratorVendor.AMD:
+            encoder_options.update(AMF_SMART_FRAGMENT_OPTIONS)
+        elif vendor is AcceleratorVendor.APPLE:
+            encoder_options.update(APPLE_SMART_FRAGMENT_OPTIONS)
+        else:
+            encoder_options.update(NVENC_SMART_FRAGMENT_OPTIONS)
     return spec, encoder_options

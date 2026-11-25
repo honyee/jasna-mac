@@ -1,6 +1,7 @@
 """The ``jasna`` command line: options, their defaults and help (``jasna.cli_help``)."""
 
 import argparse
+import sys
 from typing import get_args
 
 from jasna import __version__
@@ -89,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=CLI_HELP["working_directory"],
     )
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default="mps" if sys.platform == "darwin" else "cuda:0")
     parser.add_argument(
         "--fp16",
         default=True,

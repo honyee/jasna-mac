@@ -245,7 +245,7 @@ EN = {
         "model_basicvsrpp_description": "Fast",
         "model_ltx": "LTX",
         "model_ltx_description": "Best quality, slow",
-        "model_ltx_needs_nvidia": "Needs an NVIDIA or supported AMD GPU",
+        "model_ltx_needs_nvidia": "Needs an NVIDIA, supported AMD, or Apple Silicon GPU",
         "model_ltx_needs_newer_linux": "LTX needs Linux kernel 5.8 or newer. Update your system to use it.",
         "model_ltx_not_installed": "The LTX model isn't on this PC.",
         "ltx_model": "Model",

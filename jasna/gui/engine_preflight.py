@@ -47,7 +47,7 @@ def _engine_on_disk(path: Path, gpu: str) -> bool:
 def run_engine_preflight(settings: AppSettings) -> EnginePreflightResult:
     import torch
 
-    from jasna.accelerator import cuda_arch_name, is_nvidia_device
+    from jasna.accelerator import cuda_arch_name, default_device, is_nvidia_device
     from jasna.engine_paths import (
         default_restoration_model_path,
         expected_unet4x_engine_path,
@@ -61,9 +61,9 @@ def run_engine_preflight(settings: AppSettings) -> EnginePreflightResult:
         is_yolo_model,
     )
 
-    device = torch.device("cuda:0")
+    device = torch.device(default_device())
     if not is_nvidia_device(device) or not torch.cuda.is_available():
-        # Only NVIDIA GPUs run TensorRT engines; AMD runs every model through PyTorch.
+        # Only NVIDIA GPUs run TensorRT engines; AMD and Apple Silicon run models through PyTorch/Metal.
         return EnginePreflightResult(requirements=())
     gpu = cuda_arch_name(device)
     fp16 = bool(settings.fp16_mode)

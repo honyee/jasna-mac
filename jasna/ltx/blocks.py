@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import psutil
 import torch
 
+from jasna.accelerator import is_gpu_device, synchronize
 from jasna.media.cuda_kernel import host_register, host_unregister
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,12 @@ _NATIVE_RESIDENT_OUT_OF_MEMORY = "resident blocks on the GPU: CUDA error: out of
 def gpu_refused_resident_blocks(error: BaseException) -> bool:
     """Whether a block store failed because the GPU did not give the VRAM its resident blocks were sized for: on
     Windows a later allocation can fail although the free VRAM and the allocation probe said it fits (#818)."""
-    return isinstance(error, torch.OutOfMemoryError) or _NATIVE_RESIDENT_OUT_OF_MEMORY in str(error)
+    message = str(error)
+    return (
+        isinstance(error, torch.OutOfMemoryError)
+        or _NATIVE_RESIDENT_OUT_OF_MEMORY in message
+        or "mps backend out of memory" in message.lower()
+    )
 
 
 @dataclass(frozen=True)
@@ -163,11 +169,12 @@ class BlockStore:
             for _ in range(min(2, streamed)):
                 self._slots.append(torch.empty(max(streamed_bytes), dtype=torch.uint8, device=device))
             self._host.extend(torch.empty(nbytes, dtype=torch.uint8) for nbytes in streamed_bytes)
-            self._pinned = _pin_while_allowed(self._host)
+            cuda = device.type == "cuda"
+            self._pinned = _pin_while_allowed(self._host) if cuda else []
             self._slot_block = [-1] * len(self._slots)
-            self._copy_done = [torch.cuda.Event() for _ in self._slots]
-            self._compute_done = [torch.cuda.Event() for _ in self._slots]
-            self._copy_stream = torch.cuda.Stream(device) if self._slots else None
+            self._copy_done = [torch.cuda.Event() for _ in self._slots] if cuda else []
+            self._compute_done = [torch.cuda.Event() for _ in self._slots] if cuda else []
+            self._copy_stream = torch.cuda.Stream(device) if (cuda and self._slots) else None
         except BaseException as primary:
             try:
                 self.close()
@@ -209,29 +216,34 @@ class BlockStore:
         groups = _file_order_groups([name for name in reader.offset_keys() if name in targets], targets, stage_bytes)
         stages, pinned_stages, copied = [], [], []
 
+        cuda = self.device.type == "cuda"
+
         def destinations():
             try:
                 if stage_bytes:
                     stages.extend(torch.empty(stage_bytes, dtype=torch.uint8) for _ in range(2))
-                    pinned_stages.extend(_pin_while_allowed(stages))
-                    copied.extend(torch.cuda.Event() for _ in stages)
+                    if cuda:
+                        pinned_stages.extend(_pin_while_allowed(stages))
+                        copied.extend(torch.cuda.Event() for _ in stages)
                 for number, (group, offsets) in enumerate(groups):
                     slot = number % 2
-                    if offsets:
+                    if offsets and cuda:
                         copied[slot].synchronize()
                     views = {name: _staged(stages[slot], offsets[name], targets[name]) if name in offsets else targets[name]
                              for name in group}
                     yield views
                     for name in offsets:
-                        targets[name].copy_(views[name], non_blocking=True)
-                    if offsets:
+                        targets[name].copy_(views[name], non_blocking=cuda)
+                    if offsets and cuda:
                         copied[slot].record()
             finally:
                 if stages:
-                    torch.cuda.synchronize(self.device)
+                    if is_gpu_device(self.device):
+                        synchronize(self.device)
                     for stage in stages:
                         stage.zero_()
-                    _unregister(pinned_stages)
+                    if cuda:
+                        _unregister(pinned_stages)
 
         stream = destinations()
         try:
@@ -251,10 +263,13 @@ class BlockStore:
         busy = self._slot_of(keep) if keep is not None else None
         slot = next(s for s in range(len(self._slots)) if s != busy)
         source = self._host[index - self.resident]
-        with torch.cuda.stream(self._copy_stream):
-            self._copy_stream.wait_event(self._compute_done[slot])
-            self._slots[slot][: source.numel()].copy_(source, non_blocking=True)
-            self._copy_done[slot].record(self._copy_stream)
+        if self._copy_stream is not None:
+            with torch.cuda.stream(self._copy_stream):
+                self._copy_stream.wait_event(self._compute_done[slot])
+                self._slots[slot][: source.numel()].copy_(source, non_blocking=True)
+                self._copy_done[slot].record(self._copy_stream)
+        else:
+            self._slots[slot][: source.numel()].copy_(source)
         self._slot_block[slot] = index
 
     def acquire(self, index: int) -> dict[str, torch.Tensor]:
@@ -264,7 +279,8 @@ class BlockStore:
         else:
             self._prefetch(index, None)
             slot = self._slot_of(index)
-            torch.cuda.current_stream(self.device).wait_event(self._copy_done[slot])
+            if self._copy_stream is not None:
+                torch.cuda.current_stream(self.device).wait_event(self._copy_done[slot])
             weights = _views(self._slots[slot], self._layouts[index])
         following = (index + 1) % self.count
         if following < self.resident and self.resident < self.count:
@@ -277,7 +293,7 @@ class BlockStore:
         """Mark block ``index``'s slot reusable once the work queued so far is done.
         Call before acquiring the next block, so its prefetch waits for this work."""
         slot = self._slot_of(index) if index >= self.resident else None
-        if slot is not None:
+        if slot is not None and self._copy_stream is not None:
             self._compute_done[slot].record(torch.cuda.current_stream(self.device))
 
     def native_vram_bytes(self) -> int:
@@ -288,12 +304,12 @@ class BlockStore:
         buffers = self._resident_buffers + self._host + self._slots
         if not buffers:
             return
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        if is_gpu_device(self.device):
+            synchronize(self.device)
         for buffer in buffers:
             buffer.zero_()
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        if is_gpu_device(self.device):
+            synchronize(self.device)
         _unregister(self._pinned)
         self._resident_buffers.clear()
         self._resident.clear()

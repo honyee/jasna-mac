@@ -6,6 +6,7 @@ from argparse import Namespace
 
 import torch
 
+from jasna.accelerator import device_context
 from jasna.engine_paths import default_restoration_model_path
 from jasna.main import batch_size_from_args, decode_backend_from_env
 from jasna.benchmark.basicvsrpp_restoration import benchmark_basicvsrpp_restoration
@@ -48,7 +49,7 @@ def run_benchmarks(
                 print(f"  {fn.__name__}")
             return
 
-    with torch.cuda.device(device):
+    with device_context(device):
         for benchmark_fn in fns:
             table_rows = benchmark_fn(
                 device=device,

@@ -66,7 +66,7 @@ class RfDetrTorchRunner:
             import rfdetr
         except ImportError as exc:
             raise RuntimeError(
-                "RF-DETR on AMD requires the rfdetr package (jasna[amd])"
+                "RF-DETR torch runner requires the rfdetr package (jasna[amd] or jasna[mac])"
             ) from exc
 
         cls_name = _VARIANT_CLASSES.get(variant)

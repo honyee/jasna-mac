@@ -272,11 +272,22 @@ def _amf_h264_settings(
     }
 
 
+def _videotoolbox_h264_settings(
+    profile: str,
+    index: KeyframeIndex,
+) -> dict[str, object]:
+    del index
+    return {
+        "profile": H264_SMART_PROFILES[profile],
+    }
+
+
 # Most consecutive B-frames each vendor's H.264 encoder accepts; a smart render
 # must match the source's count, so sources above this are re-encoded whole.
 H264_SMART_MAX_B_FRAMES = {
     AcceleratorVendor.NVIDIA: 4,
     AcceleratorVendor.AMD: 3,
+    AcceleratorVendor.APPLE: 4,
 }
 
 
@@ -290,6 +301,7 @@ def h264_b_frames_over_cap(codec: str, index: KeyframeIndex, vendor: Accelerator
 _H264_SETTINGS_BY_VENDOR = {
     AcceleratorVendor.NVIDIA: _nvenc_h264_settings,
     AcceleratorVendor.AMD: _amf_h264_settings,
+    AcceleratorVendor.APPLE: _videotoolbox_h264_settings,
 }
 
 

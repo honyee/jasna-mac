@@ -32,15 +32,14 @@ def range_key(segment: SegmentRange) -> RangeKey:
 
 def ltx_render_seconds(settings: AppSettings, metadata: VideoMetadata, segment: SegmentRange) -> float:
     """Estimated LTX render time of ``segment`` on this GPU."""
-    import torch
-
+    from jasna.accelerator import default_device, device_name
     from jasna.ltx.model_files import bundle_names
     from jasna.ltx.windows import window_hop
     from jasna.ltx.speed import profile_path, segment_estimate_seconds
 
     return segment_estimate_seconds(
         profile_path(),
-        torch.cuda.get_device_name(0),
+        device_name(default_device()),
         bundle_names(settings.ltx_model, fast=settings.ltx_fast)[0],
         frames=max(1, round(segment.duration * metadata.mean_fps)),
         fps=float(metadata.mean_fps),

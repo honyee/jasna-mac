@@ -77,7 +77,7 @@ def warm_up_cuda() -> tuple[AcceleratorVendor, bool, bool]:
     An unsupported GPU gets no kernel launch; the system check reports it instead.
     Returns (GPU vendor, Blackwell GPU, frame generation support) for the GPU-specific options;
     CPU without a supported GPU."""
-    from jasna.accelerator import supports_frame_generation, supports_nvfp4, vendor_for_device
+    from jasna.accelerator import default_device, supports_frame_generation, supports_nvfp4, vendor_for_device
 
     if vendor_for_device() is AcceleratorVendor.AMD:
         driver_ok, _ = system_requirements.check_gpu_driver_version()
@@ -88,9 +88,10 @@ def warm_up_cuda() -> tuple[AcceleratorVendor, bool, bool]:
         return AcceleratorVendor.CPU, False, False
     import torch
 
-    torch.zeros(1, device="cuda")
-    vendor = vendor_for_device()
-    return vendor, supports_nvfp4("cuda:0"), supports_frame_generation("cuda:0")
+    device = default_device()
+    torch.zeros(1, device=device)
+    vendor = vendor_for_device(device)
+    return vendor, supports_nvfp4(device), supports_frame_generation(device)
 
 
 def start_cuda_warmup(on_support: Callable[[AcceleratorVendor, bool, bool], None]) -> threading.Thread:
@@ -148,6 +149,8 @@ def check_gpu() -> tuple[bool, str]:
 def check_cuda() -> tuple[bool, str]:
     try:
         import torch
+        from jasna.accelerator import has_mps
+
         if torch.cuda.is_available():
             version = torch.version.hip or torch.version.cuda
             if torch.version.hip:
@@ -159,6 +162,8 @@ def check_cuda() -> tuple[bool, str]:
                 major=capability[0],
                 minor=capability[1],
             )
+        if has_mps():
+            return True, "Metal (MPS)"
         return False, t("wizard_not_available")
     except Exception as e:
         logger.warning("GPU runtime check failed", exc_info=True)

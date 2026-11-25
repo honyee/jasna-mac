@@ -19,11 +19,15 @@ from jasna.accelerator import (
     AcceleratorVendor,
     current_stream,
     device_name,
+    enter_mps_concurrent_scope,
+    exit_mps_concurrent_scope,
     new_event,
     new_stream,
+    record_stream,
     set_device,
     stream_context,
     vendor_for_device,
+    wait_event,
 )
 from jasna.media.cas import GpuCasSharpener
 from jasna.media.container_utils import (
@@ -195,7 +199,7 @@ class VideoEncoder:
         (``jasna.frame_generation.FrameGenerationWriter``)."""
         self.device = torch.device(device)
         self.vendor = vendor_for_device(self.device)
-        if self.vendor not in {AcceleratorVendor.NVIDIA, AcceleratorVendor.AMD}:
+        if self.vendor not in {AcceleratorVendor.NVIDIA, AcceleratorVendor.AMD, AcceleratorVendor.APPLE}:
             raise RuntimeError(
                 f"GPU video encoding is not supported on {self.vendor.value}"
             )
@@ -264,6 +268,8 @@ class VideoEncoder:
                 is_hw_owned=False,
             )
             pix_fmt = self.spec.frame_format
+        elif self.vendor is AcceleratorVendor.APPLE:
+            pix_fmt = self.spec.frame_format
         else:
             pix_fmt = "cuda"
         out_v = self.dst.add_stream(self.encoder_name, **stream_kwargs)
@@ -276,6 +282,11 @@ class VideoEncoder:
         ctx.time_base = self.time_base
         ctx.framerate = self.output_fps
         ctx.pix_fmt = pix_fmt
+        if self.vendor is AcceleratorVendor.APPLE and self.codec in ("hevc", "h264"):
+            from av.codec.context import Flags
+
+            # VideoToolbox reads global_quality (in FF_QP2LAMBDA units) only when QSCALE is set.
+            ctx.flags |= Flags.qscale
         if self.smart_fragment:
             from av.codec.context import Flags
 
@@ -345,19 +356,21 @@ class VideoEncoder:
                     dtype=self._converter.sample_dtype,
                     device=self.device,
                 )
-            # The copy of the next frame into one pinned buffer overlaps AMF
+            # The copy of the next frame into one host buffer overlaps AMF/VideoToolbox
             # encoding the last one from the other.
             self._host_yuv = [
                 torch.empty(
                     (height + height // 2, width),
                     dtype=torch.uint16 if self.spec.ten_bit else torch.uint8,
-                    pin_memory=True,
+                    pin_memory=(self.device.type == "cuda"),
                 )
                 for _ in range(AMF_HOST_BUFFERS)
             ]
             self._host_ready = [new_event(self.device) for _ in self._host_yuv]
             self._amf_handoff = SlotHandoff(
-                len(self._host_yuv), self._encode_host_frame, name="AmfEncodeWorker"
+                len(self._host_yuv),
+                self._encode_host_frame,
+                name="VideoToolboxEncodeWorker" if self.vendor is AcceleratorVendor.APPLE else "AmfEncodeWorker",
             )
         self._order = EncodeOrder(hold=ENCODE_BUFFER_SIZE // 2, pts_origin=self.pts_origin)
         self._video_started = False
@@ -366,8 +379,14 @@ class VideoEncoder:
 
         self._stop_sentinel = object()
         self._encode_queue: queue.Queue = queue.Queue(maxsize=ENCODE_BUFFER_SIZE)
+        self._mps_scope = enter_mps_concurrent_scope(self.device)
         self._encode_thread = threading.Thread(target=self._encode_worker, name="VideoEncoderWorker", daemon=True)
-        self._encode_thread.start()
+        try:
+            self._encode_thread.start()
+        except BaseException:
+            exit_mps_concurrent_scope(self._mps_scope)
+            self._mps_scope = False
+            raise
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -399,6 +418,9 @@ class VideoEncoder:
         finally:
             self.dst.close()
             self._src.close()
+            if getattr(self, "_mps_scope", False):
+                self._mps_scope = False
+                exit_mps_concurrent_scope(True)
         if copy_rest_of_source and self._worker_error is not None:
             raise self._worker_error
 
@@ -412,8 +434,8 @@ class VideoEncoder:
                     return
                 if self._worker_error is None:
                     frame, pts, ready_event = item
-                    self.stream.wait_event(ready_event)
-                    frame.record_stream(self.stream)
+                    wait_event(self.stream, ready_event)
+                    record_stream(frame, self.stream)
                     self._encode_frame(frame, pts)
             except Exception as exc:
                 self._worker_error = exc
@@ -426,6 +448,10 @@ class VideoEncoder:
         frame: torch.Tensor,
         pts: int,
     ) -> tuple[torch.Tensor, int, object]:
+        if self.device.type == "mps":
+            # MPS shares one serial queue, and PyTorch's MPS Event.record holds the GIL while
+            # dispatching onto that queue (causing AB-BA deadlocks with concurrent MPS threads).
+            return frame, pts, None
         producer_stream = current_stream(self.device)
         ready_event = new_event(self.device)
         producer_stream.record_event(ready_event)
@@ -466,11 +492,14 @@ class VideoEncoder:
             f"'{self.output_path.suffix}' output on {device_name(self.device)}: {exc}"
         )
         if self.codec == "av1":
-            backend = "AMF" if self.vendor is AcceleratorVendor.AMD else "NVENC"
-            message += (
-                f". AV1 {backend} encoding requires a GPU/driver generation "
-                "that provides it."
-            )
+            if self.vendor is AcceleratorVendor.APPLE:
+                message += ". AV1 encoding on macOS uses libsvtav1."
+            else:
+                backend = "AMF" if self.vendor is AcceleratorVendor.AMD else "NVENC"
+                message += (
+                    f". AV1 {backend} encoding requires a GPU/driver generation "
+                    "that provides it."
+                )
         return RuntimeError(message)
 
     def _packed_frame(self, height: int, width: int) -> torch.Tensor:
@@ -518,23 +547,41 @@ class VideoEncoder:
                 slot = self._amf_handoff.acquire()
                 self._host_yuv[slot].copy_(
                     packed.view(torch.uint16) if self.spec.ten_bit else packed,
-                    non_blocking=True,
+                    non_blocking=(self.device.type == "cuda"),
                 )
-                self._host_ready[slot].record(self.stream)
+                if self.device.type == "cuda":
+                    self._host_ready[slot].record(self.stream)
                 self._amf_handoff.hand_off(slot, pts)
                 return
         self._send_frame(hw_frame, pts)
 
     def _encode_host_frame(self, slot: int, pts: int):
-        # AMF reads host planes, and reading them while the copy was still in
-        # flight corrupted frames (issue #252).
-        self._host_ready[slot].synchronize()
+        # AMF reads host planes after an async CUDA/HIP copy, and reading them while the copy
+        # was still in flight corrupted frames (issue #252). On MPS the unified-memory copy
+        # above is synchronous, so VideoToolbox encoding does not need to stall on the Metal queue.
+        if self.device.type == "cuda":
+            self._host_ready[slot].synchronize()
         host_yuv = self._host_yuv[slot]
         height = self.metadata.video_height
-        hw_frame = av.VideoFrame.from_dlpack(
-            [host_yuv[:height], host_yuv[height:]],
-            format=self.spec.frame_format,
-        )
+        width = self.metadata.video_width
+        if self.spec.frame_format in ("yuv420p", "yuv420p10le"):
+            # Planar 4:2:0 for libsvtav1: de-interleave NV12/P010 UV plane, and shift
+            # 10-bit P010 codes (MSB-aligned) down 6 bits to yuv420p10le (LSB-aligned).
+            uv = host_yuv[height:].view(height // 2, width // 2, 2)
+            if self.spec.ten_bit:
+                y = (host_yuv[:height].to(torch.int32) >> 6).to(torch.uint16)
+                u = (uv[..., 0].to(torch.int32) >> 6).to(torch.uint16).contiguous()
+                v = (uv[..., 1].to(torch.int32) >> 6).to(torch.uint16).contiguous()
+            else:
+                y = host_yuv[:height]
+                u = uv[..., 0].contiguous()
+                v = uv[..., 1].contiguous()
+            hw_frame = av.VideoFrame.from_dlpack([y, u, v], format=self.spec.frame_format)
+        else:
+            hw_frame = av.VideoFrame.from_dlpack(
+                [host_yuv[:height], host_yuv[height:]],
+                format=self.spec.frame_format,
+            )
         self._send_frame(hw_frame, pts)
 
     def _send_frame(self, hw_frame: av.VideoFrame, pts: int):

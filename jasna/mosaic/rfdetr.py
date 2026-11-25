@@ -9,7 +9,17 @@ from torch.nn import functional as F
 
 logger = logging.getLogger(__name__)
 
-from jasna.accelerator import cuda_arch_name, current_stream, is_amd_device, is_nvidia_device, new_stream, stream_context
+from jasna.accelerator import (
+    cuda_arch_name,
+    current_stream,
+    is_amd_device,
+    is_apple_device,
+    is_nvidia_device,
+    new_stream,
+    record_stream,
+    stream_context,
+    wait_stream,
+)
 from jasna.engine_paths import get_onnx_tensorrt_engine_path
 from jasna.media.resize_normalize import ResizeNormalizer
 from jasna.mosaic.detections import Detections
@@ -67,10 +77,10 @@ class RfDetrMosaicDetectionModel:
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
 
-        if is_amd_device(self.device):
+        if is_amd_device(self.device) or is_apple_device(self.device):
             if torch_variant is None:
                 raise RuntimeError(
-                    f"RF-DETR on AMD requires a torch variant for {weights_path.name}"
+                    f"RF-DETR on {self.device.type} requires a torch variant for {weights_path.name}"
                 )
             from jasna.mosaic.rfdetr_torch_runner import RfDetrTorchRunner
 
@@ -85,7 +95,7 @@ class RfDetrMosaicDetectionModel:
                 variant=torch_variant,
             )
             self.engine_path = self.weights_path
-            self._stream = new_stream(self.device)
+            self._stream = new_stream(self.device) if is_amd_device(self.device) else None
         elif is_nvidia_device(self.device):
             from jasna.trt import require_engine_file
             from jasna.trt.trt_runner import TrtRunner
@@ -259,12 +269,12 @@ class RfDetrMosaicDetectionModel:
         (issue #252).
         """
         caller = current_stream(self.device)
-        self._stream.wait_stream(caller)
+        wait_stream(self._stream, caller)
         with stream_context(self._stream):
             detections = self._detect(frames_uint8_bchw, target_hw)
-        caller.wait_stream(self._stream)
+        wait_stream(caller, self._stream)
         for masks in detections.masks:
-            masks.record_stream(caller)
+            record_stream(masks, caller)
         return detections
 
     def _detect(self, frames_uint8_bchw: torch.Tensor, target_hw: tuple[int, int]) -> Detections:

@@ -13,7 +13,14 @@ import psutil
 import torch
 
 from jasna import startup_timing
-from jasna.accelerator import AcceleratorVendor, device_free_bytes, device_used_bytes, vendor_for_device
+from jasna.accelerator import (
+    AcceleratorVendor,
+    device_free_bytes,
+    device_name,
+    device_total_bytes,
+    device_used_bytes,
+    vendor_for_device,
+)
 from jasna.job_resume import ResumeJob, resume_directory, saved_ltx_work
 from jasna.media.container_utils import MOV_SUFFIXES
 from jasna.media.encoder_options import nvenc_vram_beside_ltx, resolve_encoder_options
@@ -321,8 +328,7 @@ class Pipeline:
         ensure_frame_upscale_engines(self.config, source_size, upscale_size, log_callback=log.info)
 
     def _log_memory_at_end(self) -> None:
-        free, total = torch.cuda.mem_get_info(self.device)
-        log.info("VRAM usage at end — %.1f MiB", (total - free) / (1024 ** 2))
+        log.info("VRAM usage at end — %.1f MiB", device_used_bytes(self.device) / (1024 ** 2))
         log.info("RAM usage at end — %.1f MiB", psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2))
 
     def validate_metadata(self, metadata) -> None:
@@ -528,7 +534,7 @@ class Pipeline:
         from jasna.ltx.vram_budget import segment_decode_budget, segment_large_canvas
         from jasna.ltx.speed import profile_path
 
-        total_bytes = torch.cuda.get_device_properties(self.device).total_memory
+        total_bytes = device_total_bytes(self.device)
         return LtxRender(
             detector=self.job_detection_model,
             files=self.ltx_files,
@@ -592,7 +598,7 @@ class Pipeline:
 
         return segment_estimate_seconds(
             profile_path(),
-            torch.cuda.get_device_name(self.device),
+            device_name(self.device),
             self.ltx_files.transformer_name,
             frames=frames,
             fps=metadata.mean_fps,

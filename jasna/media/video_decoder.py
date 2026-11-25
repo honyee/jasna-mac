@@ -13,10 +13,14 @@ from av.video.reformatter import ColorRange as AvColorRange, VideoReformatter
 from jasna.accelerator import (
     AcceleratorVendor,
     current_stream,
+    enter_mps_concurrent_scope,
+    exit_mps_concurrent_scope,
     new_stream,
+    record_stream,
     set_device,
     stream_context,
     vendor_for_device,
+    wait_stream,
 )
 from jasna.media.container_utils import demux_video, idle_decoder_threads, keyframe_seek_pts
 from jasna.media.probe import VideoMetadata, resolve_video_start_pts
@@ -68,6 +72,10 @@ class VideoDecodeError(RuntimeError):
     pass
 
 
+def _videotoolbox_hwaccel() -> HWAccel:
+    return HWAccel("videotoolbox", allow_software_fallback=True)
+
+
 def _cuda_hwaccel(device: torch.device) -> HWAccel:
     hwaccel = HWAccel(
         "cuda",
@@ -93,7 +101,7 @@ def _empty_batch(frames: int, height: int, width: int, device: torch.device, wri
     """A uint8 RGB batch that ``writer`` fills. Its memory comes from the caller's stream, whose
     queued work may still use it, so ``writer`` waits for that work first."""
     batch = torch.empty((frames, 3, height, width), device=device, dtype=torch.uint8)
-    writer.wait_stream(current_stream(device))
+    wait_stream(writer, current_stream(device))
     return batch
 
 
@@ -159,8 +167,14 @@ class BatchPrefetcher:
         self._device = device
         self._queue: Queue = Queue(maxsize=1)
         self._stop = threading.Event()
+        self._mps_scope = enter_mps_concurrent_scope(device)
         self._thread = threading.Thread(target=self._produce, name="DecodePrefetch", daemon=True)
-        self._thread.start()
+        try:
+            self._thread.start()
+        except BaseException:
+            exit_mps_concurrent_scope(self._mps_scope)
+            self._mps_scope = False
+            raise
 
     def _produce(self) -> None:
         try:
@@ -192,12 +206,15 @@ class BatchPrefetcher:
                 raise item
             batch, pts = item
             if self._device.type != "cpu":
-                batch.record_stream(current_stream(self._device))
+                record_stream(batch, current_stream(self._device))
             yield batch, pts
 
     def close(self) -> None:
         self._stop.set()
         self._thread.join()
+        if self._mps_scope:
+            self._mps_scope = False
+            exit_mps_concurrent_scope(True)
 
 
 _VALI_OPTIONS = {
@@ -400,6 +417,8 @@ class _PyAvFrameSource:
         try:
             if not software_only and vendor is AcceleratorVendor.NVIDIA:
                 self.container = av.open(file, hwaccel=_cuda_hwaccel(device), metadata_errors="replace")
+            elif not software_only and vendor is AcceleratorVendor.APPLE:
+                self.container = av.open(file, hwaccel=_videotoolbox_hwaccel(), metadata_errors="replace")
             else:
                 self.container = av.open(file, metadata_errors="replace")
             self.video_stream = self.container.streams.video[0]
@@ -687,7 +706,7 @@ class _PyAvFrameSource:
         # NVIDIA: one staging frame on a private stream (H2D+convert ordered so the next
         # overwrite starts only after the prior kernel consumed it); the batch comes from
         # the caller's stream.
-        pinned = torch.empty((self.batch_size, H + H // 2, W), dtype=dtype, pin_memory=True)
+        pinned = torch.empty((self.batch_size, H + H // 2, W), dtype=dtype, pin_memory=(self.device.type == "cuda"))
         if self.vendor is AcceleratorVendor.AMD:
             with stream_context(stream):
                 device_yuv = torch.empty(

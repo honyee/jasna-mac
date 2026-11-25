@@ -91,7 +91,7 @@ def na3d(
     device = q.device
 
     bounds = [_window_bounds(d, k_) for d, k_ in zip(dims, kernels, strict=True)]
-    budget = NA_CUDA_SCORE_BUDGET if device.type == "cuda" else NA_SCORE_BUDGET
+    budget = NA_CUDA_SCORE_BUDGET if device.type in ("cuda", "mps") else NA_SCORE_BUDGET
     tile_t, tile_h, tile_w = _pick_tiles((t, h, q.shape[3]), kernels, budget)
 
     groups: dict[
@@ -134,7 +134,7 @@ def na3d(
     for rel, tiles in groups.items():
         mask = _group_mask(rel, q.dtype, device)
         nq, nk = mask.shape[2], mask.shape[3]
-        g_max = max(1, NA_KV_STACK_BUDGET // max(1, batch * nh * nk * hd * 2)) if device.type == "cuda" else 1
+        g_max = max(1, NA_KV_STACK_BUDGET // max(1, batch * nh * nk * hd * 2)) if device.type in ("cuda", "mps") else 1
         qs0, _ = tiles[0]
         tq = qs0[0].stop - qs0[0].start
         th = qs0[1].stop - qs0[1].start

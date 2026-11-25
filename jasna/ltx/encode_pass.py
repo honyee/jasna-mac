@@ -10,7 +10,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 import torch
 
-from jasna.accelerator import device_free_bytes
+from jasna.accelerator import device_free_bytes, is_gpu_device, mps_concurrent_scope, stream_context
 from jasna.ltx.camera import WINDOW_FRAMES
 from jasna.ltx.compose import crop_to_canvas
 from jasna.ltx.inference import (
@@ -38,7 +38,7 @@ activations (up to ~5.7 GiB for a bf16 768 px window, an eager AMD one reserves 
 def encode_gpu_window_bytes(device: torch.device) -> int:
     """Bytes of window pixels an encode pass keeps on ``device``: what the GPU has free beyond
     ``ENCODE_GPU_RESERVE_BYTES``, none on the CPU."""
-    if device.type != "cuda":
+    if not is_gpu_device(device):
         return 0
     return max(0, device_free_bytes(device) - ENCODE_GPU_RESERVE_BYTES)
 
@@ -120,13 +120,13 @@ class _WindowEncodes:
     def _encode(
         self, store: LatentStore, index: int, canvas: int, window_pixels: torch.Tensor, cropped: torch.cuda.Event | None
     ) -> None:
-        with torch.cuda.stream(self._stream), self._bar.window(canvas), torch.inference_mode():
+        with stream_context(self._stream), self._bar.window(canvas), torch.inference_mode():
             pixels = vae_pixels(self._cropped_pixels(window_pixels, cropped), self._device).unsqueeze(0)
             latent = self._encoder(pixels).cpu()
         self._writes.append(self._writer.submit(store.put, index, latent))
 
     def _send(self, window_pixels: torch.Tensor, cropped: torch.cuda.Event | None) -> PendingReply:
-        with torch.cuda.stream(self._stream):
+        with stream_context(self._stream):
             pixels = self._cropped_pixels(window_pixels, cropped).unsqueeze(0).cpu()
         return self._encoder.send(pixels)
 
@@ -204,18 +204,19 @@ def encode_span(
     projector: RegionProjector | None,
 ) -> None:
     """VAE-encode every planned window's reference crops into its segment's store."""
-    buffers = _WindowBuffers(device, encode_gpu_window_bytes(device))
-    encodes = _WindowEncodes(encoder, buffers, device, bar)
-    try:
-        encoders = [_SegmentEncoder(p, store, buffers, encodes, projector) for p, store in zip(plans, stores)]
-        for owner, batch, _pts in segment_batches(frames(), segments, batch_size):
-            check_cancel(cancel)
-            bar.update(len(batch))
-            if owner is not None:
-                for frame in batch:
-                    encoders[owner].frame(frame)
-        encodes.finish()
-        for segment_encoder in encoders:
-            segment_encoder.finish()
-    finally:
-        encodes.close()
+    with mps_concurrent_scope(device):
+        buffers = _WindowBuffers(device, encode_gpu_window_bytes(device))
+        encodes = _WindowEncodes(encoder, buffers, device, bar)
+        try:
+            encoders = [_SegmentEncoder(p, store, buffers, encodes, projector) for p, store in zip(plans, stores)]
+            for owner, batch, _pts in segment_batches(frames(), segments, batch_size):
+                check_cancel(cancel)
+                bar.update(len(batch))
+                if owner is not None:
+                    for frame in batch:
+                        encoders[owner].frame(frame)
+            encodes.finish()
+            for segment_encoder in encoders:
+                segment_encoder.finish()
+        finally:
+            encodes.close()

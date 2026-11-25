@@ -7,6 +7,8 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from jasna.accelerator import is_gpu_device, synchronize
+
 TensorSpecs = dict[str, tuple[torch.dtype, tuple[int, ...]]]
 
 
@@ -21,10 +23,10 @@ def zero_tensors(tensors: Iterable[torch.Tensor], keep: nn.Module | None = None)
             if tensor.is_meta or (tensor.device, tensor.untyped_storage().data_ptr()) in kept:
                 continue
             tensor.zero_()
-            if tensor.device.type == "cuda":
+            if is_gpu_device(tensor.device):
                 devices.add(tensor.device)
     for device in devices:
-        torch.cuda.synchronize(device)
+        synchronize(device)
 
 
 def read_host_tensors(reader, names: Iterable[str], specs: TensorSpecs) -> dict[str, torch.Tensor]:

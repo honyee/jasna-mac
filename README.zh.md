@@ -1,8 +1,66 @@
+> **macOS Apple Silicon 移植版（`jasna-mac`）**：本仓库是基于上游 [Kruk2/jasna](https://github.com/Kruk2/jasna)（`v0.12.4`，AGPL-3.0）构建的社区 macOS（Apple Silicon / Metal MPS）移植版本。项目当前进展与已知限制请见下方 [macOS 移植现状](#macos-apple-silicon-移植现状)，技术细节与基准数据见 [MACOS.md](MACOS.md)。
+>
 > **支持者模型的正版许可证码只能通过 [Ko-fi](https://ko-fi.com/kruk2)、[Unifans](https://app.unifans.io/c/kruk2) 或 [闲鱼](#在闲鱼购买) 获取。**
 
 [English](README.md) | [日本語](README.ja.md) | [**中文**](README.zh.md)
 
-# <img width="32" src="https://github.com/Kruk2/jasna/blob/main/assets/jasna-logo.png?raw=true" /> Jasna
+# <img width="32" src="https://github.com/Kruk2/jasna/blob/main/assets/jasna-logo.png?raw=true" /> Jasna（macOS Apple Silicon 移植版）
+
+Jasna 用于修复视频和图片中的马赛克。本移植分支为 **macOS Apple Silicon（M1/M2/M3/M4，Metal / MPS）** 带来了完整适配，包括 **LTX-2.5 22B 模型与 Diffusion VAE 自定义 Metal 着色器**、**Apple VideoToolbox 硬件视频编解码**，以及可直接双击打开的原生 **`Jasna.app`** 应用包。
+
+## macOS Apple Silicon 移植现状
+
+### 已完成并实测可用的功能（Apple M2 Max / 32 GiB 统一内存验证）
+
+| 模块 | 当前状态 | 说明 |
+| --- | --- | --- |
+| **Apple Silicon MPS 后端** | 已完成 | 完整实现 `AcceleratorVendor.APPLE` / `KernelBackend.APPLE_MPS` 设备检测、显存统计、流与事件抽象（[`jasna/accelerator.py`](jasna/accelerator.py)）。 |
+| **马赛克检测** | 已完成 | **RF-DETR**（`rfdetr-v6-large`）与 **YOLO**（`lada-yolo-v4`）在 MPS 上原生运行。 |
+| **BasicVSR++ 视频修复（开源）** | 已完成（真实去马赛克） | 完整跑通 MPS（含 `deform_conv2d`），GUI 与 CLI 均可直接输出真实修复视频（1080p 300 帧 RF-DETR + BasicVSR++ 约 35.6 秒）。 |
+| **LTX-2.5 22B + Diffusion VAE** | 已完成（试用/明文权重） | 自研 W8A16 ConvRot Metal 着色器（[`jasna/ltx/mps_kernels.py`](jasna/ltx/mps_kernels.py)，FP16 计算 + BF16 残差流）与 4-W 分块 Metal Flash-NA3D（[`jasna/models/ltx_vae/na_mps.py`](jasna/models/ltx_vae/na_mps.py)）。1080p 121 帧完整 4 阶段实测 **58.2 秒**（48/48 块全常驻显存、`34.7 s/step`、峰值 MPS 内存 **12.42 GiB**）。 |
+| **视频硬件编解码** | 已完成 | 支持 VideoToolbox 硬件 **H.264**（NV12）与 **10-bit HEVC**（P010，已修复 MPS 10-bit 饱和截断）、**10-bit AV1**（`libsvtav1`）编码，以及 VideoToolbox 硬件辅助解码与自动软解回退。 |
+| **PyTorch MPS 多线程稳定性** | 已修复并通过压测 | 彻底修复 PyTorch MPS 多线程死锁（GIL 安全 `_MpsEvent`、NumPy 上传防 `CompletionQueueDispatch` 互锁、移除 MPS `wait_stream`）以及 `torch.mps.empty_cache()` 触发 `MPSGraphCache::clear()` 导致的释放后使用崩溃（`mps_concurrent_scope` 延迟清理）；MPS 羽化模糊改用可分离 `conv2d` 提速约 4 倍且精度无损。 |
+| **原生双击应用（`Jasna.app`）** | 已完成 | 通过 [`scripts/build_macos_app.py`](scripts/build_macos_app.py) 编译原生 ARM64 Mach-O 启动器、多分辨率 `AppIcon.icns`、本地隔离配置与缓存、macOS 字体（`PingFang SC` / `Helvetica Neue` / `Menlo`）、Homebrew `ffmpeg` 自动发现，以及 macOS 右键粘贴与 `⌘+A` 全选适配。 |
+| **开源超分模型** | 已完成 | 支持 `SPAN` 与 `RealPLKSR` 在 MPS 上运行。 |
+
+### 当前限制与尚未支持的部分
+
+- **闭源支持者模型与激活模块（`jasna.protection`）目前无法在 macOS 使用**：
+  - 上游官方下发的加密 `.safetensors.enc` 权重（**LTX 正式修复权重**、**UNet 4x**、**SD 1.5**）以及在线/离线许可证激活全部依赖作者私有闭源模块 `jasna.protection`；该模块仅随官方 Windows / Linux x86-64 发行版分发，目前没有官方 macOS ARM64 编译版本。
+  - 因此在当前开源 macOS 版本中：
+    - 点击“**激活 Jasna**”时，许可证码输入框、单选框与激活按钮会按上游公开源码设计保持禁用状态（`protection_available() == False`）。
+    - **LTX 当前以试用模式（速度/兼容性测试）运行**：加载随机占位权重，运行后马赛克区域会呈现灰色笼罩（并非真实修复画面），仅在提供合法明文 `.safetensors` 权重时才能输出真实 LTX 画面。
+    - **请勿在官方发布 macOS 发行版之前，仅为了在 Mac 本地使用而购买正版激活码。**
+  - 如需在 Mac 本地直接获得真实去马赛克效果，请在应用中选择开源模型 **BasicVSR++**（可搭配开源超分 `SPAN` / `RealPLKSR`）。
+- **仅限 NVIDIA 的特性不可用**：TensorRT、NVDEC/VALI、NVENC、NVFP4、RTX Super Res、DLSS 5、补帧与 Topaz TVAI 均不支持 macOS。
+- **硬件覆盖范围**：已在 Apple M2 Max（32 GiB 统一内存）完成完整端到端与回归验证；16 GiB 内存机型支持 LTX 分块流式加载，但尚未做实机全流程压测。
+
+### macOS 快速开始
+
+```bash
+# 1. 环境准备：Apple Silicon Mac（macOS 14+）、Python 3.12+、FFmpeg
+brew install python@3.12 ffmpeg
+
+# 2. 克隆仓库并安装 macOS 依赖
+git clone https://github.com/honyee/jasna-mac.git
+cd jasna-mac
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[mac,dev]"
+
+# 3. 编译并启动可双击打开的原生应用 Jasna.app
+.venv/bin/python scripts/build_macos_app.py
+open Jasna.app
+
+# 4. 运行 macOS MPS 与 LTX Metal GPU 测试套（27 项）
+.venv/bin/pytest -v tests/test_macos_mps.py tests/test_ltx_mps_gpu.py
+```
+
+更完整的 Metal 内核设计、并发修复细节与实测基准数据，请参阅 **[MACOS.md](MACOS.md)**。
+
+---
+
+## 上游 Jasna 原版说明
 
 Jasna 修复视频和图片中的马赛克。Jasna 免费，提供简单的应用和命令行，在你的 GPU
 上运行。

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import torch
 
-from jasna.accelerator import device_free_bytes, release_blas_workspaces
+from jasna.accelerator import default_device, device_free_bytes, empty_cache, release_blas_workspaces
 from jasna.gui.models import AppSettings
 from jasna.gui.preview_frames import preview_image
 from jasna.gui.queues import CommandWorker, drain
@@ -192,7 +192,7 @@ class SeedRenderer:
             del decoder
             self._runtime.unload_decoder()
             release_blas_workspaces()
-            torch.cuda.empty_cache()
+            empty_cache(render.device)
         return writer
 
     def _drop_transformer(self) -> None:
@@ -200,7 +200,7 @@ class SeedRenderer:
             self._transformer = None
             self._transformer_path = None
             self._runtime.unload_transformer()
-            torch.cuda.empty_cache()
+            empty_cache()
 
     def _drop_runtime(self) -> None:
         self._transformer = None
@@ -296,7 +296,7 @@ class LtxSeedPreviewWorker(CommandWorker):
                                 directory,
                                 effect,
                                 self.metadata,
-                                lut_applier(command.settings.lut_path, torch.device("cuda:0")),
+                                lut_applier(command.settings.lut_path, torch.device(default_device())),
                                 stereo,
                             ),
                             report=lambda fraction, eta, stage: self.events.put(

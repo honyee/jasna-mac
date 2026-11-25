@@ -90,6 +90,11 @@ def _rgb_to_yuv_into(
     if code_range.storage_scale != 1:
         y.mul_(code_range.storage_scale)
         subsampled.mul_(code_range.storage_scale)
+        # View as uint16 on write: MPS saturates float->int16 at 32767 instead of wrapping
+        # 10-bit P010 codes (up to 65472) into two's-complement bits.
+        luma.view(torch.uint16).copy_(y)
+        interleave_chroma(subsampled, chroma.view(torch.uint16))
+        return
     luma.copy_(y)
     interleave_chroma(subsampled, chroma)
 

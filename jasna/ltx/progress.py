@@ -12,6 +12,7 @@ from typing import Literal
 import torch
 from tqdm import tqdm
 
+from jasna.accelerator import has_mps
 from jasna.ltx import speed
 from jasna.ltx.camera import WINDOW_FRAMES
 from jasna.ltx.inference import (
@@ -59,16 +60,51 @@ def _cuda_mark() -> torch.cuda.Event:
     return torch.cuda.Event(enable_timing=True)
 
 
+def _mps_mark() -> _WallClockMark:
+    # PyTorch's torch.Event(device="mps").record() holds the GIL while waiting on the Metal
+    # queue, causing AB-BA deadlocks when compose/decode threads run concurrently on MPS.
+    return _WallClockMark()
+
+
 TimingMark = torch.cuda.Event | _WallClockMark
+
+
+def _cuda_event_available() -> bool:
+    return torch.cuda.is_available() or torch.cuda.Event is not torch.cuda.streams.Event
+
+
+def _model_device_type(model) -> str | None:
+    device = getattr(model, "device", None)
+    if device is not None:
+        return torch.device(device).type
+    if isinstance(model, torch.nn.Module):
+        param = next(model.parameters(), None)
+        if param is not None:
+            return param.device.type
+    return None
+
+
+def _default_mark() -> TimingMark:
+    if _cuda_event_available():
+        return _cuda_mark()
+    if has_mps():
+        return _mps_mark()
+    return _WallClockMark()
 
 
 def timing_marks(model) -> Callable[[], TimingMark]:
     """How to time ``model``'s windows: the LTX worker's GPU work never reaches this process's
     stream (and Windows batches the event records), but its requests return only once that
-    work is done, so the wall clock times it; local models are timed by CUDA events."""
+    work is done, so the wall clock times it; local models are timed by CUDA/MPS events."""
     if isinstance(model, (WorkerEncoder, WorkerTransformer, WorkerDecoder)):
         return _WallClockMark
-    return _cuda_mark
+    if _model_device_type(model) == "mps":
+        return _mps_mark
+    if _cuda_event_available():
+        return _cuda_mark
+    if has_mps():
+        return _mps_mark
+    return _WallClockMark
 
 
 class Progress:
@@ -144,7 +180,7 @@ class Progress:
         return speed.run_summary(profile_key, self.timings, self._work, peak_vram_bytes, blocks)
 
     def bar(
-        self, stage: LtxStage, total: int, unit: str = "frame", marks: Callable[[], TimingMark] = _cuda_mark
+        self, stage: LtxStage, total: int, unit: str = "frame", marks: Callable[[], TimingMark] = _default_mark
     ) -> StageBar:
         """``marks`` times the pass's windows and steps (``timing_marks``)."""
         tqdm_bar = tqdm(

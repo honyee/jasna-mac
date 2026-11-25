@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, MutableMapping
-from contextlib import nullcontext
+from collections.abc import Iterator, Mapping, MutableMapping
+from contextlib import contextmanager, nullcontext
 import ctypes
 from enum import StrEnum
 import functools
@@ -12,7 +12,10 @@ import logging
 import ntpath
 import os
 from pathlib import Path
+import subprocess
 import sys
+import threading
+import time
 from typing import Any
 import uuid
 
@@ -121,17 +124,51 @@ def configure_rocm_process_env() -> None:
 class AcceleratorVendor(StrEnum):
     NVIDIA = "nvidia"
     AMD = "amd"
+    APPLE = "apple"
     CPU = "cpu"
+
+
+def has_mps() -> bool:
+    """Whether Apple Metal Performance Shaders (MPS) is available in this PyTorch build."""
+    return bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+
+
+def default_device() -> str:
+    """The default accelerator device string for this machine."""
+    if torch.cuda.is_available():
+        return "cuda:0"
+    if has_mps():
+        return "mps"
+    return "cpu"
+
+
+def is_gpu_device(device: torch.device | str) -> bool:
+    return torch.device(device).type in ("cuda", "mps")
+
+
+def is_gpu_tensor(tensor: torch.Tensor) -> bool:
+    return tensor.device.type in ("cuda", "mps")
 
 
 def vendor_for_device(device: torch.device | str | None = None) -> AcceleratorVendor:
     resolved = torch.device(device) if device is not None else None
-    if resolved is not None and resolved.type == "cpu":
-        return AcceleratorVendor.CPU
+    if resolved is not None:
+        if resolved.type == "cpu":
+            return AcceleratorVendor.CPU
+        if resolved.type == "mps":
+            return AcceleratorVendor.APPLE
+        if resolved.type == "cuda":
+            if torch.version.hip:
+                return AcceleratorVendor.AMD
+            if torch.version.cuda or torch.cuda.is_available():
+                return AcceleratorVendor.NVIDIA
+            return AcceleratorVendor.CPU
     if torch.version.hip:
         return AcceleratorVendor.AMD
     if torch.version.cuda:
         return AcceleratorVendor.NVIDIA
+    if has_mps():
+        return AcceleratorVendor.APPLE
     return AcceleratorVendor.CPU
 
 
@@ -141,6 +178,10 @@ def is_nvidia_device(device: torch.device | str | None = None) -> bool:
 
 def is_amd_device(device: torch.device | str | None = None) -> bool:
     return vendor_for_device(device) is AcceleratorVendor.AMD
+
+
+def is_apple_device(device: torch.device | str | None = None) -> bool:
+    return vendor_for_device(device) is AcceleratorVendor.APPLE
 
 
 @functools.cache
@@ -160,15 +201,23 @@ class KernelBackend(StrEnum):
     AMD_TRITON = "amd-triton"
     AMD_PREBUILT = "amd-prebuilt"
     """AMD kernels built ahead of time; packaged builds compile UNet 4x separately."""
+    APPLE_MPS = "apple-mps"
+    """Apple Silicon GPU running PyTorch MPS and custom Metal shaders."""
     CPU = "cpu"
 
     @property
     def is_amd(self) -> bool:
         return self in (KernelBackend.AMD_TRITON, KernelBackend.AMD_PREBUILT)
 
+    @property
+    def is_apple(self) -> bool:
+        return self is KernelBackend.APPLE_MPS
+
 
 def kernel_backend(device: torch.device | str) -> KernelBackend:
     resolved = torch.device(device)
+    if resolved.type == "mps":
+        return KernelBackend.APPLE_MPS
     if resolved.type != "cuda":
         return KernelBackend.CPU
     if is_amd_device(resolved):
@@ -219,6 +268,17 @@ def log_amd_backend(device: torch.device) -> None:
     )
 
 
+@functools.cache
+def log_apple_backend(device: torch.device) -> None:
+    """Log once per process the Apple Silicon MPS backend details."""
+    log.info(
+        "Apple Silicon backend: %s, torch %s, Metal working set %.1f GiB, custom Metal LTX kernels",
+        device_name(device),
+        torch.__version__,
+        device_total_bytes(device) / (1 << 30),
+    )
+
+
 def supports_nvfp4(device: torch.device | str) -> bool:
     return is_nvidia_device(device) and torch.cuda.get_device_capability(device)[0] >= 10
 
@@ -245,7 +305,7 @@ def device_module(device: torch.device | str):
 
 def device_context(device: torch.device | str):
     resolved = torch.device(device)
-    if resolved.type == "cpu":
+    if resolved.type in ("cpu", "mps"):
         return nullcontext()
     return device_module(resolved).device(resolved)
 
@@ -253,6 +313,9 @@ def device_context(device: torch.device | str):
 def stream_context(stream: Any):
     if stream is None:
         return nullcontext()
+    stream_device = getattr(stream, "device", None)
+    if stream_device is not None and torch.device(stream_device).type == "mps":
+        return torch.mps.stream(stream)
     try:
         return device_module(stream.device).stream(stream)
     except (TypeError, ValueError):
@@ -262,41 +325,255 @@ def stream_context(stream: Any):
 
 def new_stream(device: torch.device | str):
     resolved = torch.device(device)
+    if resolved.type == "cpu":
+        return None
+    if resolved.type == "mps":
+        # PyTorch MPS does not yet support wait_event/wait_stream on non-default streams;
+        # returning the default stream keeps all stream/event synchronization valid.
+        return torch.mps.current_stream()
     return device_module(resolved).Stream(resolved)
 
 
 def current_stream(device: torch.device | str):
     resolved = torch.device(device)
+    if resolved.type == "cpu":
+        return None
+    if resolved.type == "mps":
+        return torch.mps.current_stream()
     return device_module(resolved).current_stream(resolved)
 
 
-def new_event(device: torch.device | str):
-    return device_module(torch.device(device)).Event()
+class _MpsEvent:
+    """GIL-safe event for Apple MPS.
+
+    PyTorch's ``torch.Event(device="mps").record()`` calls ``dispatch_sync`` on the serial
+    Metal queue while still holding the Python GIL, which AB-BA deadlocks with MPS ops
+    (such as ``index_select``) that acquire the GIL from inside the Metal queue. Because all
+    MPS work shares one serial queue, ``record()`` avoids ``MPSEventPool::recordEvent`` and
+    ``synchronize()`` uses ``torch.mps.synchronize()`` (which releases the GIL).
+    """
+
+    def __init__(self, *, enable_timing: bool = False) -> None:
+        self._enable_timing = enable_timing
+        self._time = 0.0
+
+    def record(self, stream: Any = None) -> None:
+        if self._enable_timing:
+            torch.mps.synchronize()
+            self._time = time.monotonic()
+
+    def synchronize(self) -> None:
+        torch.mps.synchronize()
+
+    def elapsed_time(self, end: _MpsEvent) -> float:
+        return max(0.0, (end._time - self._time) * 1000.0)
+
+
+def new_event(device: torch.device | str, *, enable_timing: bool = False):
+    resolved = torch.device(device)
+    if resolved.type == "mps":
+        return _MpsEvent(enable_timing=enable_timing)
+    return device_module(resolved).Event(enable_timing=enable_timing)
+
+
+def _is_mps_stream(stream: Any) -> bool:
+    dev = getattr(stream, "device", None)
+    return dev is not None and torch.device(dev).type == "mps"
+
+
+def wait_stream(stream: Any, other: Any) -> None:
+    """Make ``stream`` wait for ``other`` on CUDA; no-op on MPS where all work shares one serial
+    Metal queue (PyTorch's MPS ``wait_stream`` calls ``dispatch_sync`` while holding the GIL)."""
+    if stream is None or other is None or stream == other or _is_mps_stream(stream) or _is_mps_stream(other):
+        return
+    stream.wait_stream(other)
+
+
+def wait_event(stream: Any, event: Any) -> None:
+    """Make ``stream`` wait for ``event`` on CUDA; no-op on MPS where all work shares one serial
+    Metal queue."""
+    if stream is None or event is None or _is_mps_stream(stream):
+        return
+    stream.wait_event(event)
+
+
+def record_stream(tensor: torch.Tensor, stream: Any) -> None:
+    if stream is None:
+        return
+    device = getattr(tensor, "device", None)
+    if device is not None and device.type != "cuda":
+        return
+    tensor.record_stream(stream)
 
 
 def set_device(device: torch.device | str) -> None:
     resolved = torch.device(device)
-    if resolved.type != "cpu":
+    if resolved.type not in ("cpu", "mps"):
         device_module(resolved).set_device(resolved)
 
 
 def synchronize(device: torch.device | str | None = None) -> None:
     if device is None:
-        torch.accelerator.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elif has_mps():
+            torch.mps.synchronize()
+        elif hasattr(torch, "accelerator") and torch.accelerator.is_available():
+            torch.accelerator.synchronize()
         return
     resolved = torch.device(device)
-    if resolved.type != "cpu":
-        device_module(resolved).synchronize(resolved)
+    if resolved.type == "cpu":
+        return
+    if resolved.type == "mps":
+        torch.mps.synchronize()
+        return
+    device_module(resolved).synchronize(resolved)
+
+
+_mps_concurrent_lock = threading.Lock()
+_mps_concurrent_depth = 0
+_mps_empty_cache_deferred = False
+
+
+def enter_mps_concurrent_scope(device: torch.device | str | None = None) -> bool:
+    """Mark that multiple threads may execute MPS ops concurrently; returns whether a scope was entered."""
+    if device is not None:
+        if torch.device(device).type != "mps":
+            return False
+    elif not has_mps():
+        return False
+    global _mps_concurrent_depth
+    with _mps_concurrent_lock:
+        _mps_concurrent_depth += 1
+    return True
+
+
+def exit_mps_concurrent_scope(entered: bool) -> None:
+    """Exit a scope started by ``enter_mps_concurrent_scope`` and flush deferred MPS cache clears once idle."""
+    if not entered:
+        return
+    global _mps_concurrent_depth, _mps_empty_cache_deferred
+    flush = False
+    with _mps_concurrent_lock:
+        if _mps_concurrent_depth > 0:
+            _mps_concurrent_depth -= 1
+        if _mps_concurrent_depth == 0 and _mps_empty_cache_deferred:
+            _mps_empty_cache_deferred = False
+            flush = True
+    if flush:
+        torch.mps.synchronize()
+        torch.mps.empty_cache()
+
+
+@contextmanager
+def mps_concurrent_scope(device: torch.device | str | None = None) -> Iterator[None]:
+    """Defer ``torch.mps.empty_cache()`` while multiple threads execute MPS ops concurrently.
+
+    PyTorch's ``MPSHooks::emptyCache()`` invokes ``MPSGraphCache::clear()``, deleting every
+    ``MPSCachedGraph*`` in the process-wide graph cache without synchronizing against threads
+    holding raw pointers to those graphs (which causes ``NSInvalidArgumentException`` /
+    use-after-free crashes in MPSGraph-backed ops like ``mm``, ``conv``, ``pad``, and ``histc``).
+    While inside this scope, ``empty_cache()`` records a deferred flush instead of clearing the
+    graph cache; PyTorch's ``MPSHeapAllocatorImpl`` still reuses freed Metal buffers internally,
+    and the deferred clear runs once the outermost scope exits after all worker threads join.
+    """
+    entered = enter_mps_concurrent_scope(device)
+    try:
+        yield
+    finally:
+        exit_mps_concurrent_scope(entered)
+
+
+def _mps_empty_cache() -> None:
+    global _mps_empty_cache_deferred
+    with _mps_concurrent_lock:
+        if _mps_concurrent_depth > 0:
+            _mps_empty_cache_deferred = True
+            return
+    torch.mps.empty_cache()
 
 
 def empty_cache(device: torch.device | str | None = None) -> None:
-    if hasattr(torch, "accelerator") and torch.accelerator.is_available():
-        torch.accelerator.empty_cache()
-        return
     if device is not None:
-        module = device_module(torch.device(device))
+        resolved = torch.device(device)
+        if resolved.type == "mps":
+            _mps_empty_cache()
+            return
+        if resolved.type == "cpu":
+            torch.cuda.empty_cache()
+            return
+        module = device_module(resolved)
         if hasattr(module, "empty_cache"):
             module.empty_cache()
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        return
+    if has_mps():
+        _mps_empty_cache()
+        return
+    torch.cuda.empty_cache()
+
+
+_mps_peak_allocated_bytes = 0
+
+
+def _update_mps_peak() -> int:
+    global _mps_peak_allocated_bytes
+    current = int(torch.mps.current_allocated_memory())
+    if current > _mps_peak_allocated_bytes:
+        _mps_peak_allocated_bytes = current
+    return current
+
+
+def memory_allocated(device: torch.device | str) -> int:
+    resolved = torch.device(device)
+    if resolved.type == "mps":
+        return _update_mps_peak()
+    if resolved.type == "cuda":
+        return int(torch.cuda.memory_allocated(resolved))
+    return 0
+
+
+def memory_reserved(device: torch.device | str) -> int:
+    resolved = torch.device(device)
+    if resolved.type == "mps":
+        _update_mps_peak()
+        return int(torch.mps.driver_allocated_memory())
+    if resolved.type == "cuda":
+        return int(torch.cuda.memory_reserved(resolved))
+    return 0
+
+
+def reset_peak_memory_stats(device: torch.device | str) -> None:
+    global _mps_peak_allocated_bytes
+    resolved = torch.device(device)
+    if resolved.type == "mps":
+        _mps_peak_allocated_bytes = int(torch.mps.current_allocated_memory())
+    elif resolved.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(resolved)
+
+
+def max_memory_allocated(device: torch.device | str) -> int:
+    resolved = torch.device(device)
+    if resolved.type == "mps":
+        _update_mps_peak()
+        return max(_mps_peak_allocated_bytes, int(torch.mps.driver_allocated_memory()))
+    if resolved.type == "cuda":
+        return int(torch.cuda.max_memory_allocated(resolved))
+    return 0
+
+
+def device_total_bytes(device: torch.device | str) -> int:
+    resolved = torch.device(device)
+    if resolved.type == "mps":
+        return int(torch.mps.recommended_max_memory())
+    try:
+        return int(torch.cuda.get_device_properties(resolved).total_memory)
+    except (AssertionError, RuntimeError, ValueError):
+        if resolved.type == "cpu":
+            return int(psutil.virtual_memory().total)
+        raise
 
 
 def release_blas_workspaces() -> None:
@@ -521,17 +798,38 @@ def warn_over_windows_budget(device: torch.device) -> bool:
 def device_free_bytes(device: torch.device) -> int:
     """VRAM free on the whole GPU. On Windows, CUDA and HIP count only this process's memory (WDDM
     hides every other process's), so NVML's device-wide figure caps it on NVIDIA there and the
-    process's Windows budget on AMD."""
-    free = torch.cuda.mem_get_info(device)[0]
-    if sys.platform == "win32" and is_nvidia_device(device):
-        return min(free, _nvml_free_bytes(device))
-    return amd_windows_budget_cap(device, free)
+    process's Windows budget on AMD. On Apple Silicon Unified Memory, Metal's recommended working
+    set minus live MPS allocations is the safe headroom (cached free allocator blocks in
+    ``driver_allocated_memory()`` are reused automatically by PyTorch without ``empty_cache()``)."""
+    resolved = torch.device(device)
+    if resolved.type == "mps":
+        _update_mps_peak()
+        return max(0, int(torch.mps.recommended_max_memory()) - int(torch.mps.current_allocated_memory()))
+    try:
+        free = torch.cuda.mem_get_info(resolved)[0]
+    except (AssertionError, RuntimeError, ValueError):
+        if resolved.type == "cpu":
+            return int(psutil.virtual_memory().available)
+        raise
+    if sys.platform == "win32" and is_nvidia_device(resolved):
+        return min(free, _nvml_free_bytes(resolved))
+    return amd_windows_budget_cap(resolved, free)
 
 
 def device_used_bytes(device: torch.device) -> int:
     """VRAM in use on the whole GPU, by every program on it: CUDA/HIP contexts, allocator
-    caches and native allocations included."""
-    return torch.cuda.mem_get_info(device)[1] - device_free_bytes(device)
+    caches and native allocations included (live allocations on Apple MPS)."""
+    resolved = torch.device(device)
+    if resolved.type == "mps":
+        _update_mps_peak()
+        return int(torch.mps.current_allocated_memory())
+    try:
+        total = torch.cuda.mem_get_info(resolved)[1]
+    except (AssertionError, RuntimeError, ValueError):
+        if resolved.type == "cpu":
+            return int(psutil.virtual_memory().used)
+        raise
+    return total - device_free_bytes(resolved)
 
 
 _ALLOCATION_PROBE_CHUNK_BYTES = 64 << 20
@@ -541,24 +839,44 @@ def allocatable_bytes(device: torch.device, limit: int) -> int:
     """How much of ``limit`` this process can really allocate on ``device`` now, found by
     allocating it in chunks and freeing them again. Windows can allow less than the free figure
     says, and without sysmem fallback the extra fails instead of spilling to RAM (#678)."""
-    torch.cuda.empty_cache()
+    resolved = torch.device(device)
+    empty_cache(resolved)
+    if resolved.type == "mps":
+        return min(limit, device_free_bytes(resolved))
     chunks = []
     allocated = 0
     while allocated < limit:
         size = min(_ALLOCATION_PROBE_CHUNK_BYTES, limit - allocated)
         try:
-            chunks.append(torch.empty(size, dtype=torch.uint8, device=device))
+            chunks.append(torch.empty(size, dtype=torch.uint8, device=resolved))
         except torch.OutOfMemoryError:
             log.info("VRAM: %d of %d MiB free can be allocated", allocated >> 20, limit >> 20)
             break
         allocated += size
     chunks.clear()
-    torch.cuda.empty_cache()
+    empty_cache(resolved)
     return allocated
+
+
+@functools.cache
+def _apple_gpu_name() -> str:
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+        brand = (out.stdout or "").strip()
+        if brand:
+            return brand
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return "Apple Silicon (MPS)"
 
 
 def device_name(device: torch.device | str) -> str:
     resolved = torch.device(device)
     if resolved.type == "cpu":
         return "CPU"
+    if resolved.type == "mps":
+        return _apple_gpu_name()
     return str(device_module(resolved).get_device_name(resolved))

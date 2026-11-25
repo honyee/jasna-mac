@@ -10,6 +10,7 @@ from contextlib import closing
 
 import torch
 
+from jasna.accelerator import empty_cache, is_gpu_device, mps_concurrent_scope, stream_context, synchronize
 from jasna.ltx.compose import Candidate, composite_frame
 from jasna.ltx.inference import (
     GPU_WINDOWS_MIN_FREE_BYTES,
@@ -54,16 +55,19 @@ def _held_device(device: torch.device, free: int) -> torch.device:
     """Where a decoded window waits: in host memory while its budget is under
     ``GPU_WINDOWS_MIN_FREE_BYTES``, since a frame can need every open window of its tracks and
     holding them on the GPU would shrink the next decode's budget; from there on on the GPU."""
-    return device if device.type == "cuda" and free >= GPU_WINDOWS_MIN_FREE_BYTES else torch.device("cpu")
+    return device if is_gpu_device(device) and free >= GPU_WINDOWS_MIN_FREE_BYTES else torch.device("cpu")
 
 
 def _decode_window(
     decoder, latent: torch.Tensor, seed: int, canvas: int, budget: DecodeBudget, device: torch.device
 ) -> torch.Tensor:
     """Decoded window as uint8 ``[F, 3, S, S]``, held where ``_held_device`` says."""
-    free = _decode_free_bytes(budget, canvas, torch.cuda.empty_cache)
+    free = _decode_free_bytes(budget, canvas, lambda: empty_cache(device))
     with torch.inference_mode():
-        return decoded_frames(decoder, latent, seed, free, device).to(_held_device(device, free))
+        frames = decoded_frames(decoder, latent, seed, free, device).to(_held_device(device, free))
+    if device.type == "mps":
+        synchronize(device)
+    return frames
 
 
 def _send_window_decode(
@@ -76,7 +80,7 @@ def _send_window_decode(
     allocators have handed their caches back, as in this process."""
 
     def empty_caches() -> None:
-        torch.cuda.empty_cache()
+        empty_cache()
         decoder.release_cache()
 
     free = _decode_free_bytes(budget, canvas, empty_caches)
@@ -155,7 +159,7 @@ class _SegmentComposer:
         """The decoded window, and on CUDA an event its decode stream records after it: the decode
         thread starts the next window while the GPU still finishes this one."""
         latent = latent.result()
-        with torch.cuda.stream(self._stream), self._bar.window(window.canvas):
+        with stream_context(self._stream), self._bar.window(window.canvas):
             video = _decode_window(
                 self._decoder,
                 latent,
@@ -186,7 +190,7 @@ class _SegmentComposer:
         """The frames of a window the worker decoded, read on a thread of their own while the next
         window decodes there."""
         reply, free = sent.result()
-        with torch.cuda.stream(self._stream):
+        with stream_context(self._stream):
             video = reply.tensors()[0].to(_held_device(self._device, free))
         return video, self._decoded_mark()
 
@@ -277,37 +281,38 @@ def compose_span(
     from jasna.media.video_decoder import BatchPrefetcher
 
     feather = feather_pixels(frame_h)
-    decodes = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LtxDecode")
-    receives = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LtxDecodeReceive")
-    latent_reads = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LtxLatentRead")
-    cuda = device.type == "cuda"
-    decode_stream = torch.cuda.Stream(device) if cuda else None
-    try:
-        composers = [
-            _SegmentComposer(
-                p, decoder, store, seed=segment.seed, feather=feather, budget=budget, device=device, bar=bar,
-                decodes=decodes, receives=receives, latent_reads=latent_reads, stream=decode_stream,
-                super_res=super_res, projector=projector,
-            )
-            for p, store, segment in zip(plans, finals, span.segments)
-        ]
-        with torch.cuda.stream(torch.cuda.Stream(device, priority=-1) if cuda else None):
-            writer = span.open_writer()
-            try:
-                with closing(BatchPrefetcher(span.frames(), device)) as frames:
-                    for owner, batch, pts in segment_batches(iter(frames), span.segments, batch_size):
-                        check_cancel(cancel)
-                        bar.update(len(batch))
-                        for frame, frame_pts in zip(batch, pts):
-                            if owner is None:
-                                writer.write(frame, frame_pts)
-                            else:
-                                writer.write(composers[owner].frame(frame), frame_pts)
-                writer.finish()
-            finally:
-                writer.close()
-    finally:
-        decodes.shutdown(cancel_futures=True)
-        # every window sent to the worker is read to its end: the replies behind it wait for that
-        receives.shutdown()
-        latent_reads.shutdown(cancel_futures=True)
+    with mps_concurrent_scope(device):
+        decodes = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LtxDecode")
+        receives = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LtxDecodeReceive")
+        latent_reads = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LtxLatentRead")
+        cuda = device.type == "cuda"
+        decode_stream = torch.cuda.Stream(device) if cuda else None
+        try:
+            composers = [
+                _SegmentComposer(
+                    p, decoder, store, seed=segment.seed, feather=feather, budget=budget, device=device, bar=bar,
+                    decodes=decodes, receives=receives, latent_reads=latent_reads, stream=decode_stream,
+                    super_res=super_res, projector=projector,
+                )
+                for p, store, segment in zip(plans, finals, span.segments)
+            ]
+            with stream_context(torch.cuda.Stream(device, priority=-1) if cuda else None):
+                writer = span.open_writer()
+                try:
+                    with closing(BatchPrefetcher(span.frames(), device)) as frames:
+                        for owner, batch, pts in segment_batches(iter(frames), span.segments, batch_size):
+                            check_cancel(cancel)
+                            bar.update(len(batch))
+                            for frame, frame_pts in zip(batch, pts):
+                                if owner is None:
+                                    writer.write(frame, frame_pts)
+                                else:
+                                    writer.write(composers[owner].frame(frame), frame_pts)
+                    writer.finish()
+                finally:
+                    writer.close()
+        finally:
+            decodes.shutdown(cancel_futures=True)
+            # every window sent to the worker is read to its end: the replies behind it wait for that
+            receives.shutdown()
+            latent_reads.shutdown(cancel_futures=True)

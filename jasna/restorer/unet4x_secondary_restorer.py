@@ -96,14 +96,14 @@ class Unet4xSecondaryRestorer:
     prefers_cpu_input = False
 
     def __init__(self, *, device: torch.device, fp16: bool = True) -> None:
-        from jasna.accelerator import has_triton, is_amd_device
+        from jasna.accelerator import has_triton, is_amd_device, is_apple_device
 
         self.device = torch.device(device)
         self.fp16 = bool(fp16)
         self.runner = None
         self.model = None
 
-        if is_amd_device(self.device):
+        if is_amd_device(self.device) or is_apple_device(self.device):
             from jasna.models.unet4x import Unet4x
 
             self._dtype = torch.float16 if self.fp16 else torch.float32

@@ -12,7 +12,7 @@ from typing import Protocol
 
 import torch
 
-from jasna.accelerator import empty_cache, ipc_collect
+from jasna.accelerator import empty_cache, ipc_collect, mps_concurrent_scope, set_device
 from jasna.blend_buffer import BlendBuffer
 from jasna.crop_buffer import CropBuffer
 from jasna.frame_queue import FrameQueue
@@ -105,7 +105,7 @@ def decode_detect_loop(
     """Decode, detect and track; ``pipeline`` supplies the detector, tracker settings and VR layout."""
     timer = LoopTimer("decode-detect")
     try:
-        torch.cuda.set_device(ctx.device)
+        set_device(ctx.device)
         with ctx.open_reader() as reader, torch.inference_mode():
             if progress is not None:
                 progress.init()
@@ -236,7 +236,7 @@ def primary_restore_loop(ctx: PassContext) -> None:
     timer = LoopTimer("primary")
     restoration_pipeline = ctx.restoration_pipeline
     try:
-        torch.cuda.set_device(ctx.device)
+        set_device(ctx.device)
         log.debug("[primary] thread starting")
         while not ctx.stop_event.is_set():
             ctx.primary_idle_event.set()
@@ -280,7 +280,7 @@ def secondary_restore_loop(ctx: PassContext) -> None:
     timer = LoopTimer("secondary")
     restoration_pipeline = ctx.restoration_pipeline
     try:
-        torch.cuda.set_device(ctx.device)
+        set_device(ctx.device)
         log.debug("[secondary] thread starting")
         while not ctx.stop_event.is_set():
             try:
@@ -320,7 +320,7 @@ def blend_encode_loop(ctx: PassContext, frame_writer: PassFrameWriter, vram_offl
     blend_buffer = ctx.blend_buffer
     encode_queue = ctx.encode_queue
     try:
-        torch.cuda.set_device(ctx.device)
+        set_device(ctx.device)
 
         def _flat_frames(rdr: VideoReader):
             for batch, pts in rdr.frames(seek_ts=ctx.seek_ts):
@@ -564,7 +564,7 @@ def run_async_secondary(ctx: PassContext) -> SecondaryLoopStats:
 
 def async_secondary_restore_loop(ctx: PassContext) -> None:
     try:
-        torch.cuda.set_device(ctx.device)
+        set_device(ctx.device)
         stats = run_async_secondary(ctx)
         log.info(
             "Secondary — clips: %d pushed / %d popped, pusher stall: %.1fs, starvation flushes: %d (%.1fs)",
@@ -673,24 +673,25 @@ def run_restoration_pass(
             target=blend_encode_loop, args=(ctx, frame_writer, vram_offloader), name="BlendEncode", daemon=True
         ),
     ]
-    vram_offloader.start()
-    for thread in threads:
-        thread.start()
-
-    try:
-        while any(thread.is_alive() for thread in threads):
-            if poll is not None and poll():
-                cancel_event.set()
-            if cancel_event.wait(0.05) or ctx.error_holder:
-                break
-    finally:
-        # Also on Ctrl+C: the workers stop before the caller closes the encoder and models they use.
-        ctx.stop_event.set()
+    with mps_concurrent_scope(device):
+        vram_offloader.start()
         for thread in threads:
-            while thread.is_alive():
-                _drain(queues)
-                thread.join(timeout=0.02)
-        vram_offloader.stop()
+            thread.start()
+
+        try:
+            while any(thread.is_alive() for thread in threads):
+                if poll is not None and poll():
+                    cancel_event.set()
+                if cancel_event.wait(0.05) or ctx.error_holder:
+                    break
+        finally:
+            # Also on Ctrl+C: the workers stop before the caller closes the encoder and models they use.
+            ctx.stop_event.set()
+            for thread in threads:
+                while thread.is_alive():
+                    _drain(queues)
+                    thread.join(timeout=0.02)
+            vram_offloader.stop()
 
     error = ctx.error_holder[0] if ctx.error_holder else None
     del ctx, queues, clip_queue, secondary_queue, encode_queue, metadata_queue

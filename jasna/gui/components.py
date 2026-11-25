@@ -1,6 +1,7 @@
 """Reusable UI components for Jasna GUI."""
 
 import math
+import sys
 import time
 import tkinter
 import customtkinter as ctk
@@ -187,7 +188,7 @@ class _SupportButton(ctk.CTkButton):
 
 
 def attach_entry_context_menu(entry: ctk.CTkEntry) -> tkinter.Menu:
-    """Right-click menu with clipboard actions, for users who don't know Ctrl+V."""
+    """Right-click menu with clipboard actions, for users who don't know Ctrl+V / Cmd+V."""
     widget = entry._entry
     menu = tkinter.Menu(
         widget, tearoff=0,
@@ -201,6 +202,8 @@ def attach_entry_context_menu(entry: ctk.CTkEntry) -> tkinter.Menu:
     menu.add_command(label=t("ctx_select_all"), command=lambda: widget.select_range(0, "end"))
 
     def _popup(event):
+        if str(widget.cget("state")) == "disabled":
+            return "break"
         widget.focus_set()
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -209,6 +212,13 @@ def attach_entry_context_menu(entry: ctk.CTkEntry) -> tkinter.Menu:
         return "break"
 
     widget.bind("<Button-3>", _popup)
+    if sys.platform == "darwin":
+        # On macOS Tk/Aqua, right-click is Button-2 (and Control+Click is Control-Button-1),
+        # and Entry does not bind Cmd+A to select-all by default.
+        widget.bind("<Button-2>", _popup)
+        widget.bind("<Control-Button-1>", _popup)
+        widget.bind("<Command-a>", lambda _e: (widget.select_range(0, "end"), "break")[1])
+        widget.bind("<Command-A>", lambda _e: (widget.select_range(0, "end"), "break")[1])
     return menu
 
 

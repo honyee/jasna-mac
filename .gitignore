@@ -81,3 +81,10 @@ assets/benchmark/
 
 # release-built native LTX block (jasna.ltx.native.prebuild)
 jasna/ltx/native/prebuilt/
+
+# macOS .app bundle and isolated local runtime config/cache
+Jasna.app/
+.jasna_config/
+.cache/
+.DS_Store
+jasna/protection/*

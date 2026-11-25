@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 
+from jasna.accelerator import is_nvidia_device, synchronize
 from jasna.restorer.basicvsrpp_sub_engines import compile_basicvsrpp_engines
 from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
 from jasna.restorer.basicvsrpp_sub_engines import BasicVSRPlusPlusNetSplit
@@ -17,10 +18,10 @@ RUNS = 100
 
 
 def _timed(label: str, fn, *args, **kwargs):
-    torch.cuda.synchronize()
+    synchronize()
     t0 = time.perf_counter()
     result = fn(*args, **kwargs)
-    torch.cuda.synchronize()
+    synchronize()
     dt = time.perf_counter() - t0
     print(f"  {label:30s} {dt*1000:8.1f} ms")
     return result
@@ -32,7 +33,7 @@ def _profile_split_forward(split: BasicVSRPlusPlusNetSplit, device: torch.device
 
     for _ in range(WARMUP):
         split(lqs)
-    torch.cuda.synchronize()
+    synchronize(device)
 
     print(f"\n=== Profiling BasicVSRPlusPlusNetSplit (T={T}) ===")
     n, t, c, h, w = lqs.size()
@@ -68,10 +69,10 @@ def _profile_split_forward(split: BasicVSRPlusPlusNetSplit, device: torch.device
 
     durations: list[float] = []
     for _ in range(RUNS):
-        torch.cuda.synchronize()
+        synchronize(device)
         t0 = time.perf_counter()
         split(lqs)
-        torch.cuda.synchronize()
+        synchronize(device)
         durations.append(time.perf_counter() - t0)
 
     med = statistics.median(durations)
@@ -90,7 +91,7 @@ def benchmark_basicvsrpp_restoration(
         return
     path = restoration_model_path.resolve()
 
-    use_tensorrt = compile_basicvsrpp and compile_basicvsrpp_engines(str(path), device, fp16)
+    use_tensorrt = compile_basicvsrpp and is_nvidia_device(device) and compile_basicvsrpp_engines(str(path), device, fp16)
     restorer = BasicvsrppMosaicRestorer(
         checkpoint_path=str(path),
         device=device,
@@ -116,7 +117,7 @@ def benchmark_basicvsrpp_restoration(
             for _ in range(RUNS):
                 start = time.perf_counter()
                 restorer.raw_process(video)
-                torch.cuda.synchronize()
+                synchronize(device)
                 durations.append(time.perf_counter() - start)
 
         med = statistics.median(durations)

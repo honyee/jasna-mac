@@ -20,7 +20,14 @@ from pathlib import Path
 import torch
 
 from jasna._frozen import is_frozen
-from jasna.accelerator import allocatable_bytes, warn_over_windows_budget
+from jasna.accelerator import (
+    allocatable_bytes,
+    is_gpu_device,
+    memory_allocated,
+    memory_reserved,
+    synchronize,
+    warn_over_windows_budget,
+)
 from jasna.ltx import transformer as T
 from jasna.ltx.blocks import BlockStore, OpaqueBlockStore, gpu_refused_resident_blocks
 from jasna.ltx.host_tensors import read_host_tensors, zero_tensors
@@ -153,9 +160,11 @@ def _load_blocks(reader, names: list[dict[str, str]], device: torch.device, resi
 def _block_functions(
     device: torch.device, block_specs: dict[str, tuple[torch.dtype, tuple[int, ...]]]
 ) -> tuple[Callable, Callable, str]:
-    """(block forward, prompt key/value, backend name) for plain-tensor blocks: the native block
-    when it can run here, with eager prompt keys/values (once per block and step), else both
-    compiled."""
+    """(block forward, prompt key/value, backend name) for plain-tensor blocks: Metal shaders on
+    Apple MPS, the native block when it can run on CUDA/ROCm, with eager prompt keys/values (once
+    per block and step), else both compiled."""
+    if device.type == "mps":
+        return T.block_forward, T.prompt_key_value, "Metal (MPS)"
     from jasna.ltx import native
 
     native_forward = native.load(device, block_specs)
@@ -214,6 +223,13 @@ class LtxTransformer:
 
     def _resident_blocks(self, sizes: list[int]) -> int:
         free = self._free_vram(self.device)
+        if self.device.type == "mps":
+            resident = resident_block_count(sizes, lambda limit: free)
+            logger.info(
+                "LTX MPS memory at load: %d MiB free, %d/%d blocks fit resident",
+                free >> 20, resident, len(sizes),
+            )
+            return resident
         if self.device.type != "cuda":
             return resident_block_count(sizes, lambda limit: free)
         probed = []
@@ -234,8 +250,8 @@ class LtxTransformer:
         if self.blocks is not None:
             self.blocks.close()
             self.blocks = None
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        if is_gpu_device(self.device):
+            synchronize(self.device)
         tensors = list(self.top.values())
         for condition in self.conditions:
             tensors.extend((condition.block_rows, condition.output_rows, condition.prompt_rows))
@@ -256,7 +272,7 @@ class LtxTransformer:
 
     def _group_size(self, windows: int, tokens: int) -> int:
         free = self._free_vram(self.device)
-        free += torch.cuda.memory_reserved(self.device) - torch.cuda.memory_allocated(self.device)
+        free += memory_reserved(self.device) - memory_allocated(self.device)
         fits = (free - _window_workspace_bytes(tokens)) // _window_state_bytes(tokens, stg=bool(self.stg_scale))
         return max(1, min(windows, int(fits)))
 
@@ -338,13 +354,13 @@ class LtxTransformer:
         return out
 
 
-def _pinned_windows(count: int, shape: tuple[int, ...]) -> list[torch.Tensor]:
-    """``count`` bf16 host tensors of ``shape`` in pinned memory, packed into chunks of
-    ``PINNED_CHUNK_BYTES`` (the pinned allocator rounds every allocation up to a power of two)."""
+def _pinned_windows(count: int, shape: tuple[int, ...], *, pin_memory: bool = True) -> list[torch.Tensor]:
+    """``count`` bf16 host tensors of ``shape`` in pinned memory (when ``pin_memory``), packed into
+    chunks of ``PINNED_CHUNK_BYTES`` (the pinned allocator rounds every allocation up to a power of two)."""
     per_chunk = max(1, PINNED_CHUNK_BYTES // (math.prod(shape) * torch.bfloat16.itemsize))
     windows: list[torch.Tensor] = []
     for start in range(0, count, per_chunk):
-        chunk = torch.empty((min(per_chunk, count - start), *shape), dtype=torch.bfloat16, pin_memory=True)
+        chunk = torch.empty((min(per_chunk, count - start), *shape), dtype=torch.bfloat16, pin_memory=pin_memory)
         windows.extend(chunk.unbind(0))
     return windows
 
@@ -371,7 +387,10 @@ class _FusedChain:
         self._held = None
 
     def _store(self, index: int, latent: torch.Tensor) -> None:
-        self._host[index][:, : self._tokens].copy_(latent, non_blocking=True)
+        # On MPS, a non_blocking D2H copy into CPU memory can still be in flight when
+        # the next step reads host[index] back on the CPU thread; keep D2H synchronous
+        # on unified memory (overhead <0.1 ms per window).
+        self._host[index][:, : self._tokens].copy_(latent, non_blocking=(latent.device.type == "cuda"))
 
 
 def denoise_windows(
@@ -393,7 +412,7 @@ def denoise_windows(
     frames, height, width = references[0].shape[2:]
     tokens_per_frame = height * width
     tokens = frames * tokens_per_frame
-    host = _pinned_windows(len(references), (1, 2 * tokens, references[0].shape[1]))
+    host = _pinned_windows(len(references), (1, 2 * tokens, references[0].shape[1]), pin_memory=(device.type == "cuda"))
     for window, reference in zip(host, references):
         window[:, tokens:].copy_(patchify(reference))
     shared = shared_latents(window_hop)
@@ -406,13 +425,13 @@ def denoise_windows(
     for step in range(steps):
         for start in range(0, len(host), group):
             members = range(start, min(start + group, len(host)))
-            inputs = [host[i].to(device, non_blocking=True) for i in members]
+            inputs = [host[i].to(device, non_blocking=(device.type == "cuda")) for i in members]
             denoised = denoise(inputs, step)
             for i, x, value in zip(members, inputs, denoised):
                 chain.push(i, _euler(x[:, :tokens], value, sigmas, step), shared.ramp)
             advance(len(members))
         chain.flush()
-    torch.cuda.current_stream(device).synchronize()
+    synchronize(device)
     return [unpatchify(window[:, :tokens], frames, height, width) for window in host]
 
 

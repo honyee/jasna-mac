@@ -142,7 +142,11 @@ class Sd15InpaintRestorer:
         noise = torch.randn_like(init_latents)
         latents = self.scheduler.add_noise(init_latents, noise, t_start.unsqueeze(0))
 
-        ctx = torch.autocast("cuda", dtype=torch.float16) if (self.fp16 and self.device.type == "cuda") else nullcontext()
+        ctx = (
+            torch.autocast(self.device.type, dtype=torch.float16)
+            if (self.fp16 and self.device.type in ("cuda", "mps"))
+            else nullcontext()
+        )
         with ctx:
             for t in self.scheduler.timesteps[start_step:]:
                 unet_input = torch.cat([latents, mask_latents, mosaic_latents], dim=1)

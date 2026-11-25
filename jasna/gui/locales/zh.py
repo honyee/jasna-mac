@@ -245,7 +245,7 @@ ZH = {
         "model_basicvsrpp_description": "速度快",
         "model_ltx": "LTX",
         "model_ltx_description": "画质最好，速度慢",
-        "model_ltx_needs_nvidia": "需要 NVIDIA 或兼容的 AMD 显卡",
+        "model_ltx_needs_nvidia": "需要 NVIDIA、兼容的 AMD 或 Apple Silicon 显卡",
         "model_ltx_needs_newer_linux": "LTX 需要 Linux 内核 5.8 或更新版本。请更新系统后再使用。",
         "model_ltx_not_installed": "此电脑上没有 LTX 模型。",
         "ltx_model": "模型",

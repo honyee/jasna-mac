@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from jasna.accelerator import KernelBackend, kernel_backend
+from jasna.accelerator import KernelBackend, is_gpu_tensor, kernel_backend
 from jasna.models.ltx_vae.eager_na import na3d
 from jasna.tensor_utils import compile_static
 
@@ -196,6 +196,10 @@ def decoder_kernels(device: torch.device) -> DecoderKernels:
 
         return DecoderKernels(na_triton.na3d, diffusion_triton.residual_swiglu_, diffusion_triton.slab_qkv,
                               diffusion_triton.proj_residual_, diffusion_triton.context_add_)
+    if backend is KernelBackend.APPLE_MPS:
+        from jasna.models.ltx_vae import na_mps
+
+        return DecoderKernels(na3d=na_mps.na3d)
     return DecoderKernels()
 
 
@@ -215,7 +219,7 @@ def neighborhood_attention(
     if q.dtype != v.dtype or k.dtype != v.dtype:
         q = q.to(dtype=v.dtype)
         k = k.to(dtype=v.dtype)
-    if attn.kernels.na3d is not None and q.is_cuda:
+    if attn.kernels.na3d is not None and is_gpu_tensor(q):
         return attn.kernels.na3d(q, k, v, list(attn.kernel_size), query_w_start)
     return na3d(q, k, v, attn.kernel_size, query_w_start)
 

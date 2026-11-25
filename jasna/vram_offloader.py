@@ -12,6 +12,14 @@ from queue import Queue
 
 import torch
 
+from jasna.accelerator import (
+    device_free_bytes,
+    device_total_bytes,
+    device_used_bytes,
+    empty_cache,
+    memory_allocated,
+    memory_reserved,
+)
 from jasna.blend_buffer import BlendBuffer
 from jasna.crop_buffer import CropBuffer, RawCrop
 from jasna.frame_queue import FrameQueue
@@ -142,7 +150,7 @@ class VramOffloader:
         self._blend_buffer = blend_buffer
         self._crop_buffers = crop_buffers
 
-        gpu_total = torch.cuda.get_device_properties(device).total_memory
+        gpu_total = device_total_bytes(device)
         self._threshold = max(0, gpu_total - VRAM_SAFETYNET)
 
         self.stats = VramStats()
@@ -171,13 +179,12 @@ class VramOffloader:
 
     def _run(self) -> None:
         while not self._stop.wait(_POLL_INTERVAL):
-            free, total = torch.cuda.mem_get_info(self._device)
-            used = total - free
+            used = device_used_bytes(self._device)
             self.stats.update(used)
             if used > self._threshold:
                 freed = self._offload(used - self._threshold)
                 if freed > 0:
-                    torch.cuda.empty_cache()
+                    empty_cache(self._device)
                     self.stats.offload_count += 1
                     self.stats.total_offloaded_bytes += freed
                     _log.debug(
@@ -212,11 +219,12 @@ class VramOffloader:
         crop_sizes = {k: v.frame_count for k, v in list(self._crop_buffers.items())}
         lines.append(f"  crop_buffers: track_ids={list(crop_sizes)} sizes={crop_sizes}")
 
-        free, total = torch.cuda.mem_get_info(self._device)
+        free = device_free_bytes(self._device)
+        used = device_used_bytes(self._device)
         lines.append(
-            f"  VRAM: used={((total - free) / _MIB):.0f} MiB"
-            f" allocated={torch.cuda.memory_allocated(self._device) / _MIB:.0f} MiB"
-            f" reserved={torch.cuda.memory_reserved(self._device) / _MIB:.0f} MiB"
+            f"  VRAM: used={(used / _MIB):.0f} MiB"
+            f" allocated={memory_allocated(self._device) / _MIB:.0f} MiB"
+            f" reserved={memory_reserved(self._device) / _MIB:.0f} MiB"
             f" free={free / _MIB:.0f} MiB"
         )
 

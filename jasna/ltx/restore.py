@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from jasna.accelerator import release_blas_workspaces
+from jasna.accelerator import device_name, release_blas_workspaces, reset_peak_memory_stats
 from jasna.ltx import speed
 from jasna.ltx.compose_pass import compose_span
 from jasna.ltx.encode_pass import encode_span
@@ -416,7 +416,8 @@ def _first_frames(frames: FrameSource, count: int) -> FrameSource:
 
 
 def _profile_key(render: LtxRender) -> str:
-    return speed.profile_key(torch.cuda.get_device_name(render.device), render.files.transformer_name, render.budget_name)
+    name = device_name(render.device) if render.device.type == "mps" else torch.cuda.get_device_name(render.device)
+    return speed.profile_key(name, render.files.transformer_name, render.budget_name)
 
 
 def restore_spans(
@@ -455,7 +456,7 @@ def _restore_spans(
 ) -> None:
     profile_key = _profile_key(render)
     progress.expect(speed.load_rates(render.speed_profile, profile_key))
-    torch.cuda.reset_peak_memory_stats(render.device)
+    reset_peak_memory_stats(render.device)
     blocks = None
     resuming = any(directory.glob("*.plans.npz"))
     prepared = prepare_spans(spans, render, directory, progress=progress, cancel=cancel, runtime=runtime)

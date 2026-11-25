@@ -30,19 +30,33 @@ FFPROBE_MAJOR_VERSION = 8
 
 
 def check_supported_gpu(
-    device: str = "cuda:0",
+    device: str | None = None,
 ) -> tuple[bool, str] | tuple[bool, tuple[str, int, int]]:
     """Validate the GPU supported by the current vendor-specific build."""
     try:
         import torch
-        from jasna.accelerator import AcceleratorVendor, amd_gpu_architecture, vendor_for_device
+        from jasna.accelerator import (
+            AcceleratorVendor,
+            amd_gpu_architecture,
+            default_device,
+            device_name,
+            has_mps,
+            vendor_for_device,
+        )
         from jasna.rocm_bootstrap import kernel_pack_architectures
     except ImportError:
         logger.warning("PyTorch failed to import", exc_info=True)
         return False, "no_cuda"
+    vendor = vendor_for_device(device)
+    if vendor is AcceleratorVendor.APPLE:
+        if not has_mps():
+            return False, "no_cuda"
+        return True, device_name(device or "mps")
+    if device is None:
+        device = "cuda:0"
     if not torch.cuda.is_available():
         return False, "no_cuda"
-    if vendor_for_device(device) is AcceleratorVendor.AMD:
+    if vendor is AcceleratorVendor.AMD:
         # Without kernels for the GPU's arch the first kernel launch fails, and on Windows
         # crashes the process (issues #408, #661).
         arch = amd_gpu_architecture(device)
@@ -100,7 +114,8 @@ def parse_ffmpeg_major_version(version_output: str) -> int:
 
 FFMPEG_DOWNLOAD_LINKS = (
     "Linux: https://www.ffmpeg.org/download.html  "
-    "Windows: https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z"
+    "Windows: https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z  "
+    "macOS: brew install ffmpeg"
 )
 
 
@@ -284,6 +299,12 @@ def check_gpu_driver_version() -> tuple[bool | None, str]:
             return False, f"ROCm {hip_version} is installed but no AMD GPU is available"
         return driver_ok, f"ROCm {hip_version}; {driver_info}"
 
+    if sys.platform == "darwin" and not torch.version.cuda:
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            mac_ver = platform.mac_ver()[0] or platform.release()
+            return True, f"macOS {mac_ver} (Metal / MPS)"
+        return False, "Apple Metal (MPS) is not available in this PyTorch build"
+
     nvidia_smi = find_executable("nvidia-smi")
     if not nvidia_smi:
         return False, "nvidia-smi not found"
@@ -362,6 +383,8 @@ def install_on_hard_disk() -> bool:
     drive type cannot be told (network shares, RAID, virtual disks)."""
     if sys.platform == "win32":
         return _windows_drive_has_seek_penalty(_install_dir())
+    if sys.platform == "darwin":
+        return False
     device = _linux_block_device(_install_dir())
     return sysfs_block_is_rotational(Path(f"/sys/dev/block/{os.major(device)}:{os.minor(device)}"))
 

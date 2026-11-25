@@ -215,7 +215,9 @@ class Processor:
             self._end_job_log()
 
         try:
-            release_session_memory("cuda:0")
+            from jasna.accelerator import default_device
+
+            release_session_memory(default_device())
         except Exception:
             logger.warning("Torch cleanup failed after job", exc_info=True)
 

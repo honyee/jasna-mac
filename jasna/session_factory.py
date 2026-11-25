@@ -284,19 +284,19 @@ def secondary_restorations_for(vendor: "AcceleratorVendor") -> tuple[SecondaryRe
 
     if vendor is AcceleratorVendor.NVIDIA:
         return get_args(SecondaryRestorationName)
-    if vendor is AcceleratorVendor.AMD:
+    if vendor in (AcceleratorVendor.AMD, AcceleratorVendor.APPLE):
         return ("none", "unet-4x")
     return ("none",)
 
 
 def upscale_models_for(vendor: "AcceleratorVendor", platform: str) -> tuple[UpscaleModelName, ...]:
     """The whole-video upscalers a GPU of ``vendor`` can run on ``platform``: the AI networks on
-    NVIDIA and AMD, RTX Super Res only on NVIDIA, DLSS 5 only on NVIDIA under Windows."""
+    NVIDIA, AMD, and Apple Silicon, RTX Super Res only on NVIDIA, DLSS 5 only on NVIDIA under Windows."""
     from jasna.accelerator import AcceleratorVendor
 
     if vendor is AcceleratorVendor.NVIDIA:
         return ("none", "span", "realplksr", "rtx-super-res", *(("dlss5",) if platform == "win32" else ()))
-    if vendor is AcceleratorVendor.AMD:
+    if vendor in (AcceleratorVendor.AMD, AcceleratorVendor.APPLE):
         return ("none", "span", "realplksr")
     return ("none",)
 
@@ -308,19 +308,33 @@ def build_restoration_session(
 ) -> RestorationSession:
     import torch
 
-    from jasna.accelerator import is_amd_device, log_amd_backend, supports_frame_generation, vendor_for_device
+    from jasna.accelerator import (
+        AcceleratorVendor,
+        is_amd_device,
+        is_apple_device,
+        log_amd_backend,
+        log_apple_backend,
+        supports_frame_generation,
+        vendor_for_device,
+    )
 
     device = torch.device(config.device)
     if is_amd_device(device):
         log_amd_backend(device)
+    elif is_apple_device(device):
+        log_apple_backend(device)
     if config.frame_generation != "none" and not supports_frame_generation(device):
         raise ValueError(FRAME_GENERATION_NEEDS_RTX_40)
     if config.tvai_denoise and config.secondary_restoration != "tvai":
         raise ValueError("TVAI Denoise requires secondary restoration 'tvai'")
     vendor = vendor_for_device(device)
     if config.secondary_restoration not in secondary_restorations_for(vendor):
+        if vendor is AcceleratorVendor.AMD:
+            raise ValueError(
+                f"Secondary restoration '{config.secondary_restoration}' is not available in the AMD build yet"
+            )
         raise ValueError(
-            f"Secondary restoration '{config.secondary_restoration}' is not available in the AMD build yet"
+            f"Secondary restoration '{config.secondary_restoration}' is not available on {vendor.value}"
         )
     if config.upscale_model == "dlss5":
         from jasna.upscale.dlss5 import dlss5_runtime_dir, dlss5_unavailable_reason
@@ -369,7 +383,7 @@ def provide_restoration_models(
 def _build_basicvsrpp_pipeline(
     config: SessionConfig, device: "torch.device", *, log_callback: Callable[[str], None] | None
 ) -> "RestorationPipeline":
-    from jasna.accelerator import is_amd_device
+    from jasna.accelerator import is_amd_device, is_apple_device
     from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
     from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
     from jasna.restorer.denoise import DenoiseStrength
@@ -380,7 +394,7 @@ def _build_basicvsrpp_pipeline(
         EngineCompilationRequest(
             device=str(device),
             fp16=bool(config.fp16),
-            basicvsrpp=config.compile_basicvsrpp and not is_amd_device(device),
+            basicvsrpp=config.compile_basicvsrpp and not is_amd_device(device) and not is_apple_device(device),
             basicvsrpp_model_path=str(model_path),
             detection=True,
             detection_model_name=config.detection_model_name,

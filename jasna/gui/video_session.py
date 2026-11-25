@@ -63,6 +63,7 @@ def video_session_config(
     codec: str,
     encoder_settings: Mapping[str, object],
 ) -> SessionConfig:
+    from jasna.accelerator import default_device
     from jasna.engine_paths import default_restoration_model_path
     from jasna.ltx.windows import window_hop
     from jasna.mosaic.detection_registry import (
@@ -71,6 +72,7 @@ def video_session_config(
         require_detection_model_weights,
     )
 
+    device_str = str(default_device())
     det_name = coerce_detection_model_name(str(settings.detection_model))
     standard_model = settings.restoration_model == "basicvsrpp"
     ltx_unsupported = () if standard_model else ltx_unsupported_options(
@@ -80,9 +82,9 @@ def video_session_config(
     )
     secondary_restoration = "none" if "secondary_restoration" in ltx_unsupported else settings.secondary_restoration
     return SessionConfig(
-        device="cuda:0",
+        device=device_str,
         fp16=bool(settings.fp16_mode),
-        batch_size=default_detection_batch_size("cuda:0"),
+        batch_size=default_detection_batch_size(device_str),
         detection_model_name=det_name,
         detection_model_path=require_detection_model_weights(det_name),
         detection_score_threshold=float(settings.detection_score_threshold),
@@ -175,6 +177,7 @@ def build_image_session(
     """Load the mosaic detector and SD 1.5 inpaint restorer used for still images."""
     import torch
 
+    from jasna.accelerator import default_device
     from jasna.engine_paths import SD15_DIR
     from jasna.gui.locales import t
     from jasna.mosaic.detection_registry import default_detection_batch_size, resolve_detection_model
@@ -186,7 +189,7 @@ def build_image_session(
     detection_model_name, detection_model_path, _ = resolve_detection_model(
         str(settings.detection_model), "", None
     )
-    device = torch.device("cuda:0")
+    device = torch.device(default_device())
     return build_session(
         detection_model_name,
         detection_model_path,
@@ -201,11 +204,11 @@ def build_image_session(
 def release_session_memory(device: "torch.device") -> None:
     import gc
     import torch
-    from jasna.accelerator import empty_cache, ipc_collect, synchronize
+    from jasna.accelerator import empty_cache, has_mps, ipc_collect, synchronize
 
     for _ in range(3):
         gc.collect()
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() or has_mps():
         synchronize(device)
         empty_cache(device)
         ipc_collect(device)

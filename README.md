@@ -1,10 +1,68 @@
+> **macOS Apple Silicon Port (`jasna-mac`)**: This repository is a community macOS (Apple Silicon / Metal MPS) port based on upstream [Kruk2/jasna](https://github.com/Kruk2/jasna) (`v0.12.4`, AGPL-3.0). See [Current macOS Port Status](#macos-apple-silicon-port-status) below and [MACOS.md](MACOS.md) for architecture & benchmark details.
+>
 > **The only places to get a genuine License code for the supporter models are [Ko-fi](https://ko-fi.com/kruk2), [Unifans](https://app.unifans.io/c/kruk2), and for China the seller in the [Chinese README](README.zh.md#在闲鱼购买).**
 >
 > **支持者模型的正版许可证码只能通过 [Ko-fi](https://ko-fi.com/kruk2)、[Unifans](https://app.unifans.io/c/kruk2) 或 [闲鱼](README.zh.md#在闲鱼购买) 获取。**
 
 [**English**](README.md) | [日本語](README.ja.md) | [中文](README.zh.md)
 
-# <img width="32" src="https://github.com/Kruk2/jasna/blob/main/assets/jasna-logo.png?raw=true" /> Jasna 
+# <img width="32" src="https://github.com/Kruk2/jasna/blob/main/assets/jasna-logo.png?raw=true" /> Jasna (macOS Apple Silicon Port)
+
+Jasna restores mosaics in videos and images. This fork brings native **macOS Apple Silicon (Metal / MPS)** support, custom Metal kernels for the **LTX-2.5 22B** model & Diffusion VAE, **Apple VideoToolbox** hardware video encoding/decoding, and a clickable **`Jasna.app`** macOS application bundle.
+
+## macOS Apple Silicon Port Status
+
+### What Works Today (Verified on Apple M2 Max, 32 GiB Unified Memory)
+
+| Area | Status | Notes |
+| --- | --- | --- |
+| **Apple Silicon MPS Backend** | Working | Native `AcceleratorVendor.APPLE` / `KernelBackend.APPLE_MPS` device, memory, stream, and event abstraction ([`jasna/accelerator.py`](jasna/accelerator.py)). |
+| **Mosaic Detection** | Working | **RF-DETR** (`rfdetr-v6-large`) and **YOLO** (`lada-yolo-v4`) running natively on MPS. |
+| **BasicVSR++ Restoration (Open Source)** | Working (Real Output) | Full real de-mosaicing on MPS (including `deform_conv2d`), verified end-to-end in GUI & CLI (~35.6 s for 300f 1080p with RF-DETR + BasicVSR++). |
+| **LTX-2.5 22B Transformer + Diffusion VAE** | Working (Trial / Plaintext Only) | Custom W8A16 ConvRot Metal shaders ([`jasna/ltx/mps_kernels.py`](jasna/ltx/mps_kernels.py), FP16 GEMM/SDPA + BF16 residual) and 4-W-tiled Metal Flash-NA3D ([`jasna/models/ltx_vae/na_mps.py`](jasna/models/ltx_vae/na_mps.py)). Full 4-pass 121f 1080p run completes in **58.2 s** (`48/48` blocks resident, `34.7 s/step`, `12.42 GiB` peak MPS memory). |
+| **Video Encode / Decode** | Working | Hardware **H.264** (`h264_videotoolbox`, NV12) and **10-bit HEVC** (`hevc_videotoolbox`, P010), software **10-bit AV1** (`libsvtav1`), plus VideoToolbox hardware-assisted decode with automatic fallback. |
+| **PyTorch MPS Concurrency Stability** | Fixed & Tested | Resolved multi-threaded MPS deadlocks (GIL-safe `_MpsEvent`, NumPy buffer staging, no MPS `wait_stream`) and `torch.mps.empty_cache()` / `MPSGraphCache::clear()` use-after-free crashes via `mps_concurrent_scope`; ~4x faster bit-exact separable `conv2d` feather blur on MPS. |
+| **Clickable macOS App (`Jasna.app`)** | Working | Native ARM64 Mach-O launcher ([`scripts/build_macos_app.py`](scripts/build_macos_app.py)), multi-res `AppIcon.icns`, isolated `.jasna_config`/`.cache`, native macOS UI/CJK fonts, Homebrew `ffmpeg`/`ffprobe` detection, macOS right-click & `Cmd+A` entry bindings. |
+| **Open-Source Upscalers** | Working | `SPAN` and `RealPLKSR` supported on MPS. |
+
+### Current Limitations & Known Gaps
+
+- **Closed-Source Supporter Models & Activation (`jasna.protection`) Are Not Available on macOS**:
+  - Official encrypted `.safetensors.enc` weights (**LTX restored weights**, **UNet 4x**, **SD 1.5**) and license activation depend on the upstream author's private closed-source `jasna.protection` module, which is only shipped in official Windows and Linux x86-64 releases (no macOS ARM64 build exists).
+  - As a result, in this open-source macOS build:
+    - The **Activate Jasna** dialog intentionally keeps its license input and buttons disabled (matching upstream open-source behavior).
+    - **LTX runs in Trial Mode (speed/compatibility test)** using random placeholder weights — detected mosaic areas appear covered by a gray haze rather than restored pixels — unless legitimate plaintext `.safetensors` weights are supplied.
+    - **Do not purchase a Jasna supporter license expecting to activate it locally on macOS** until upstream ships an official macOS release.
+  - For real de-mosaicing on macOS today, select **BasicVSR++** (open-source weights, ready out of the box).
+- **NVIDIA-Only Features Unavailable**: TensorRT, NVDEC/VALI, NVENC, NVFP4, RTX Super Res, DLSS 5, Frame Generation, and Topaz TVAI are not available on macOS.
+- **Hardware Coverage**: Verified end-to-end on Apple M2 Max (32 GiB Unified Memory). 16 GiB Apple Silicon Macs support automatic LTX block streaming from RAM, but full real-world tuning on 16 GiB hardware is not yet benchmarked.
+
+### macOS Quick Start
+
+```bash
+# 1. Prerequisites: Apple Silicon Mac (macOS 14+), Python 3.12+, FFmpeg
+brew install python@3.12 ffmpeg
+
+# 2. Clone and install macOS dependencies
+git clone https://github.com/honyee/jasna-mac.git
+cd jasna-mac
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[mac,dev]"
+
+# 3. Build and launch the native macOS app
+.venv/bin/python scripts/build_macos_app.py
+open Jasna.app
+
+# 4. Run macOS MPS & LTX Metal GPU test suites (27 tests)
+.venv/bin/pytest -v tests/test_macos_mps.py tests/test_ltx_mps_gpu.py
+```
+
+For full technical details, Metal kernel notes, and benchmark tables, see **[MACOS.md](MACOS.md)**.
+
+---
+
+## Upstream Jasna Documentation
 
 Jasna restores mosaics in videos and images. It is free, has a simple app
 and a command line, and runs on your GPU.

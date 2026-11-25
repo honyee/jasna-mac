@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from jasna.accelerator import empty_cache
 from jasna.ltx.kernel_policy import is_amd
 from jasna.models.ltx_vae.ops import PerChannelStatistics, PixelNorm, patchify
 from jasna.models.ltx_vae.tiling import SpatioTemporalScaleFactors
@@ -323,7 +324,7 @@ def _layer_input(sample: torch.Tensor, layer: nn.Module) -> torch.Tensor:
 
 def _release_cache(encoder: VideoEncoder) -> None:
     if encoder.releases_cache_between_stages:
-        torch.cuda.empty_cache()
+        empty_cache()
 
 
 def encode_cropped(encoder: VideoEncoder, sample: torch.Tensor) -> torch.Tensor:

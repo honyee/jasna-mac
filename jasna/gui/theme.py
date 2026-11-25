@@ -12,10 +12,19 @@ _WINDOWS_UI_FAMILY_BY_LANGUAGE = {
     "th": "Leelawadee UI",
 }
 
+_MACOS_UI_FAMILY_BY_LANGUAGE = {
+    "zh": "PingFang SC",
+    "ja": "Hiragino Sans",
+    "ko": "Apple SD Gothic Neo",
+    "th": "Thonburi",
+}
+
 
 def font_families_for_platform(platform: str, language: str) -> tuple[str, str]:
     if platform.startswith("linux"):
         return "sans-serif", "monospace"
+    if platform == "darwin":
+        return _MACOS_UI_FAMILY_BY_LANGUAGE.get(language, "Helvetica Neue"), "Menlo"
     if platform == "win32":
         script_family = _WINDOWS_UI_FAMILY_BY_LANGUAGE.get(language)
         if script_family is not None:

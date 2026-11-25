@@ -3,7 +3,7 @@ from __future__ import annotations
 import statistics
 from typing import Callable
 
-import torch
+from jasna.accelerator import synchronize
 
 
 def run_repeatedly(
@@ -15,5 +15,5 @@ def run_repeatedly(
     for _ in range(runs):
         duration, result = fn()
         durations.append(duration)
-        torch.cuda.synchronize()
+        synchronize()
     return statistics.median(durations), result

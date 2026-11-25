@@ -12,7 +12,7 @@ from typing import TypeVar
 import torch
 from torch import nn
 
-from jasna.accelerator import KernelBackend, kernel_backend
+from jasna.accelerator import KernelBackend, empty_cache, kernel_backend
 from jasna.ltx.host_tensors import read_host_tensors, zero_tensors
 from jasna.ltx.kernel_policy import gpu_architecture
 from jasna.ltx.model_files import open_tensors
@@ -209,9 +209,11 @@ def load_video_encoder(vae_path: Path, device: torch.device, encoder_path: Path 
                 encoder.run_fp16_convs_on_triton(head.triton_convs)
         # Without Triton the encoder runs eagerly: there MIOpen and ROCm's copies run the tail faster
         # in NCDHW (1.39 -> 1.28 s per 512 window on an R9700); kitchen's head needs channels-last.
+        # On Apple MPS, Conv3d is ~2.5x faster in contiguous NCDHW than channels_last_3d.
         eager_amd = backend is KernelBackend.AMD_PREBUILT
-        for layer in (encoder.conv_in, *encoder.down_blocks[:AMD_KITCHEN_DOWN_BLOCKS]) if eager_amd else (encoder,):
-            layer.to(memory_format=torch.channels_last_3d)
+        if backend is not KernelBackend.APPLE_MPS:
+            for layer in (encoder.conv_in, *encoder.down_blocks[:AMD_KITCHEN_DOWN_BLOCKS]) if eager_amd else (encoder,):
+                layer.to(memory_format=torch.channels_last_3d)
         if eager_amd:
             encoder.release_cache_between_stages()
         zero_tensors(bf16_contiguous_weights, encoder)
@@ -290,7 +292,9 @@ def decode_latent(
     while True:
         try:
             return _decode_in_tiles(decoder, latent, pixels, tiling, generator)
-        except torch.OutOfMemoryError as refused:
+        except (torch.OutOfMemoryError, RuntimeError) as refused:
+            if not isinstance(refused, torch.OutOfMemoryError) and "out of memory" not in str(refused).lower():
+                raise
             free_bytes = free_bytes * 3 // 4
             try:
                 tiling = _decode_tiling(decoder, pixels, free_bytes)
@@ -331,7 +335,7 @@ def _free_compile_garbage() -> None:
     reference cycles, activations included (GiBs at 768 px); collect them so the next window's
     decode budget sees that memory free. A full collection costs ~90 ms with a job's heap."""
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache()
 
 
 def _log_tiling(frames: int, height: int, width: int, tiling: TileSizeConfig) -> None:

@@ -191,9 +191,11 @@ class _ScanTensorCollector:
         self._gpu_masks = None
         self._gpu_scores = None
 
+        from jasna.accelerator import device_free_bytes
+
         sample_bytes = self.mask_h * self.mask_w + 4
         required_bytes = self.capacity * sample_bytes
-        free_bytes, _ = torch.cuda.mem_get_info()
+        free_bytes = device_free_bytes(self.device)
         projected_free = free_bytes - required_bytes
         if projected_free <= SCAN_VRAM_RESERVE_BYTES:
             self._enable_spill()
@@ -237,7 +239,7 @@ class _ScanTensorCollector:
         )
 
     def _enable_spill(self) -> None:
-        import torch
+        from jasna.accelerator import empty_cache
 
         if self._spilling:
             return
@@ -247,7 +249,7 @@ class _ScanTensorCollector:
                 self._cpu_masks[: self.count].copy_(self._gpu_masks[: self.count])
                 self._cpu_scores[: self.count].copy_(self._gpu_scores[: self.count])
             del self._gpu_masks, self._gpu_scores
-            torch.cuda.empty_cache()
+            empty_cache(self.device)
         self._gpu_masks, self._gpu_scores = self._allocate_gpu(self._spill_capacity())
         self._buffer_count = 0
         self._spilling = True
@@ -267,13 +269,14 @@ class _ScanTensorCollector:
 
     def add(self, scores, masks, *, count: int) -> None:
         import torch
+        from jasna.accelerator import device_free_bytes
 
         count = int(count)
         if self.count + count > self.capacity:
             raise RuntimeError("Video contains more frames than reported by its metadata")
         if (
             not self._spilling
-            and torch.cuda.mem_get_info()[0] <= SCAN_VRAM_RESERVE_BYTES
+            and device_free_bytes(self.device) <= SCAN_VRAM_RESERVE_BYTES
         ):
             self._enable_spill()
 
@@ -300,7 +303,7 @@ class _ScanTensorCollector:
                     self._flush()
 
     def finish(self):
-        import torch
+        from jasna.accelerator import empty_cache
 
         if self._spilling:
             self._flush()
@@ -310,7 +313,7 @@ class _ScanTensorCollector:
             scores = tuple(self._gpu_scores[: self.count].cpu().tolist())
             masks = self._gpu_masks[: self.count].cpu()
         del self._gpu_masks, self._gpu_scores
-        torch.cuda.empty_cache()
+        empty_cache(self.device)
         return scores, masks
 
 
@@ -375,18 +378,20 @@ class MosaicScanWorker(CommandWorker):
                 self._on_stopped()
         finally:
             detector.close()
+            from jasna.accelerator import default_device
             from jasna.gui.video_session import release_session_memory
 
-            release_session_memory("cuda:0")
+            release_session_memory(default_device())
 
     def _build_detector(self):
         import torch
 
+        from jasna.accelerator import default_device
         from jasna.mosaic.detection_registry import default_detection_batch_size, resolve_detection_model
         from jasna.session_factory import build_compiled_detection_model
 
         settings = self.settings
-        device = torch.device("cuda:0")
+        device = torch.device(default_device())
         detection_model_name, detection_model_path, _ = resolve_detection_model(
             str(settings.detection_model), "", None
         )
@@ -411,12 +416,12 @@ class MosaicScanWorker(CommandWorker):
     def _scan(self, detector) -> None:
         import torch
 
-        from jasna.accelerator import is_amd_device
+        from jasna.accelerator import default_device, is_amd_device, is_apple_device
         from jasna.media.video_decoder import VideoReader
         from jasna.mosaic.detection_registry import default_detection_batch_size
 
         metadata = self.metadata
-        device = torch.device("cuda:0")
+        device = torch.device(default_device())
         duration = float(metadata.duration)
         frame_stride = scan_sample_stride(metadata.video_fps, seconds=self.stride_seconds)
         sample_stride_seconds = frame_stride / float(metadata.video_fps)
@@ -432,7 +437,7 @@ class MosaicScanWorker(CommandWorker):
             int(metadata.video_width),
             int(metadata.video_height),
             duration,
-            amd=is_amd_device(device),
+            amd=is_amd_device(device) or is_apple_device(device),
         )
         segment_capacity = (
             capacity if decoders == 1 else math.ceil(capacity / decoders) + batch_size
@@ -582,11 +587,12 @@ class MosaicScanWorker(CommandWorker):
     def _detect_mask(self, detector, command: _MaskRequest) -> ScanMaskReady:
         import torch
 
+        from jasna.accelerator import default_device
         from jasna.media.video_decoder import VideoReader
         from jasna.mosaic.detection_registry import default_detection_batch_size
 
         metadata = self.metadata
-        device = torch.device("cuda:0")
+        device = torch.device(default_device())
         batch_size = default_detection_batch_size(device)
         reader = VideoReader(
             str(self.path),

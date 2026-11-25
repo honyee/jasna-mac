@@ -124,7 +124,7 @@ class YoloMosaicDetectionModel:
         if self.max_det <= 0:
             raise ValueError(f"max_det must be > 0, got {max_det}")
 
-        self.fp16 = bool(fp16) and (self.device.type == "cuda")
+        self.fp16 = bool(fp16) and (self.device.type in ("cuda", "mps"))
         self.imgsz = int(imgsz)
         if self.imgsz <= 0:
             raise ValueError(f"imgsz must be > 0, got {imgsz}")

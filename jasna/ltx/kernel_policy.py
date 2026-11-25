@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import torch
 
-from jasna.accelerator import TRITON_HIP_ARCHITECTURES, amd_gpu_architecture, is_amd_device
+from jasna.accelerator import TRITON_HIP_ARCHITECTURES, amd_gpu_architecture, is_amd_device, is_apple_device
 
 ROTATE_QUANTIZE_WARPS = 8
 GROUP_M = 8
@@ -79,7 +79,7 @@ class BlockDims:
 
 def is_amd(architecture: tuple[int, int] | str) -> bool:
     """Whether ``architecture`` (``gpu_architecture``) is an AMD gfx name."""
-    return isinstance(architecture, str)
+    return isinstance(architecture, str) and architecture.startswith("gfx")
 
 
 def profile_name(architecture: tuple[int, int] | str, *, fp4: bool) -> str:
@@ -101,7 +101,9 @@ def gemm_tile(n: int, k: int, architecture: tuple[int, int] | str) -> tuple[int,
 
 
 def gpu_architecture(device: torch.device) -> tuple[int, int] | str:
-    """Key of the tile tables: the CUDA capability on NVIDIA, the gfx name on AMD."""
+    """Key of the tile tables: the CUDA capability on NVIDIA, the gfx name on AMD, or 'apple-mps' on Apple Silicon."""
+    if is_apple_device(device):
+        return "apple-mps"
     return amd_gpu_architecture(device) if is_amd_device(device) else torch.cuda.get_device_capability(device)
 
 
@@ -120,6 +122,8 @@ def int8_cross_attention(architecture: tuple[int, int] | str) -> bool:
 
 
 def supports(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
     architecture = gpu_architecture(device)
     return architecture in INT8_MM_TILES or architecture in AMD_INT8_MM_TILES or architecture in CUBLAS_INT8_MM
 

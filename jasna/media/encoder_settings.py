@@ -32,6 +32,11 @@ _ENCODER_CQ_SPECS: dict[
         "hevc": EncoderCqSpec(default=25, minimum=0, maximum=51),
         "av1": EncoderCqSpec(default=16, minimum=1, maximum=51),
     },
+    AcceleratorVendor.APPLE: {
+        "h264": EncoderCqSpec(default=25, minimum=1, maximum=51),
+        "hevc": EncoderCqSpec(default=28, minimum=1, maximum=51),
+        "av1": EncoderCqSpec(default=35, minimum=1, maximum=63),
+    },
 }
 
 
@@ -215,6 +220,33 @@ AMF_SUPPORTED_ENCODER_SETTINGS_BY_CODEC: dict[str, frozenset[str]] = {
     "av1": _COMMON_AMF_ENCODER_SETTINGS | {"bitdepth", "aq_mode"},
 }
 
+# User-facing Apple VideoToolbox (hevc/h264) and SVT-AV1 (av1) settings.
+# ``cq`` is kept as a portable Jasna option (lower = higher quality): mapped to
+# VideoToolbox ``global_quality`` (1..100 scale) or SVT-AV1 ``crf``.
+_COMMON_VIDEOTOOLBOX_ENCODER_SETTINGS: frozenset[str] = frozenset(
+    {
+        "cq",
+        "profile",
+        "g",
+        "allow_sw",
+        "require_sw",
+        "realtime",
+        "prio_speed",
+        "power_efficient",
+        "spatial_aq",
+        "max_ref_frames",
+        "constant_bit_rate",
+        "maxrate",
+        "bufsize",
+    }
+)
+
+APPLE_SUPPORTED_ENCODER_SETTINGS_BY_CODEC: dict[str, frozenset[str]] = {
+    "hevc": _COMMON_VIDEOTOOLBOX_ENCODER_SETTINGS,
+    "h264": _COMMON_VIDEOTOOLBOX_ENCODER_SETTINGS | {"level", "coder"},
+    "av1": frozenset({"cq", "preset", "g", "svtav1-params", "maxrate", "bufsize"}),
+}
+
 
 
 def _parse_encoder_setting_scalar(value: str) -> object:
@@ -267,11 +299,13 @@ def validate_encoder_settings(
     codec: str,
     vendor: AcceleratorVendor | str,
 ) -> dict[str, object]:
-    by_codec = (
-        AMF_SUPPORTED_ENCODER_SETTINGS_BY_CODEC
-        if AcceleratorVendor(str(vendor)) is AcceleratorVendor.AMD
-        else SUPPORTED_ENCODER_SETTINGS_BY_CODEC
-    )
+    resolved_vendor = AcceleratorVendor(str(vendor))
+    if resolved_vendor is AcceleratorVendor.AMD:
+        by_codec = AMF_SUPPORTED_ENCODER_SETTINGS_BY_CODEC
+    elif resolved_vendor is AcceleratorVendor.APPLE:
+        by_codec = APPLE_SUPPORTED_ENCODER_SETTINGS_BY_CODEC
+    else:
+        by_codec = SUPPORTED_ENCODER_SETTINGS_BY_CODEC
     if "spatial_aq" in settings and "spatial-aq" in settings:
         raise ValueError(
             "Conflicting encoder settings: spatial_aq and spatial-aq are aliases; use only one"

@@ -54,6 +54,14 @@ def crop_to_canvas(frame: torch.Tensor, crop: CropFrame, projector: RegionProjec
     return content
 
 
+def _numpy_to_device(array: np.ndarray, device: torch.device, *, non_blocking: bool = False) -> torch.Tensor:
+    if device.type == "mps":
+        # Copy out of NumPy before uploading to MPS so Metal's CompletionQueueDispatch thread
+        # never acquires the Python GIL to DECREF a numpy-backed StorageImpl during buffer dealloc.
+        return torch.tensor(array, device=device)
+    return torch.from_numpy(array).to(device, non_blocking=non_blocking)
+
+
 @functools.lru_cache(maxsize=64)
 def _area_weights(out_size: int, in_size: int, device: torch.device) -> torch.Tensor:
     """``[out, in]`` pixel-area resampling weights (OpenCV INTER_AREA for downscaling), computed on
@@ -67,7 +75,7 @@ def _area_weights(out_size: int, in_size: int, device: torch.device) -> torch.Te
     hi = np.minimum(starts[:, None] + scale, edges[None, 1:])
     weights = (np.maximum(hi - lo, 0.0) * (1.0 / scale)).astype(np.float32)
     # Non-blocking: the driver stages a small pageable source before returning, without waiting for queued kernels.
-    return torch.from_numpy(weights).to(device, non_blocking=True)
+    return _numpy_to_device(weights, device, non_blocking=True)
 
 
 def canvas_to_source(
@@ -102,7 +110,7 @@ def _resampled_crop(canvas: torch.Tensor, crop: CropFrame) -> torch.Tensor:
 @functools.cache
 def _gaussian(radius: int, device: torch.device) -> torch.Tensor:
     kernel = cv2.getGaussianKernel(2 * radius + 1, 0.0, cv2.CV_32F)[:, 0]
-    return torch.from_numpy(kernel).to(device)
+    return _numpy_to_device(kernel, device)
 
 
 def feather_alpha(mask: torch.Tensor, feather: int, box: tuple[int, int, int, int]) -> torch.Tensor:
@@ -141,7 +149,16 @@ def _blur_band(radius: int, length: int, device: torch.device) -> torch.Tensor:
 def _dilate_and_blur(mask: torch.Tensor, feather: int) -> torch.Tensor:
     # Matrix products, not conv2d: the box size changes every frame, and MIOpen benchmarks
     # every new conv shape (~50 ms each on an R9700) before it runs it.
+    if mask.numel() == 0:
+        return torch.zeros(mask.shape, dtype=torch.float32, device=mask.device)
     dilated = dilate_ellipse(mask, feather)[None, None].float()
+    if mask.device.type == "mps":
+        # On Apple Silicon MPS, separable 1D conv2d matches the matrix product bit-for-bit,
+        # runs ~4x faster across varying box shapes, and avoids per-shape MPSGraph matmul
+        # compilation overhead (~380 MB RSS bloat).
+        kernel = _gaussian(feather, mask.device)
+        rows = F.conv2d(F.pad(dilated, (feather, feather, 0, 0), mode="reflect"), kernel.view(1, 1, 1, -1))
+        return F.conv2d(F.pad(rows, (0, 0, feather, feather), mode="reflect"), kernel.view(1, 1, -1, 1))[0, 0]
     height, width = mask.shape
     rows = F.pad(dilated, (feather, feather, 0, 0), mode="reflect")[0, 0] @ _blur_band(feather, width, mask.device)
     columns = F.pad(rows[None, None], (0, 0, feather, feather), mode="reflect")[0, 0]
@@ -176,7 +193,7 @@ def crop_edge_ramp(
 
     rows, cols = axis(y1, y2, height, wy1, wy2), axis(x1, x2, width, wx1, wx2)
     # Non-blocking: the driver stages a small pageable source before returning, without waiting for queued kernels.
-    both = torch.from_numpy(np.concatenate((rows, cols))).to(device, non_blocking=True)
+    both = _numpy_to_device(np.concatenate((rows, cols)), device, non_blocking=True)
     return torch.minimum(both[: len(rows), None], both[len(rows) :][None, :])
 
 
@@ -217,7 +234,7 @@ def polygon_mask(polygons: Sequence[Polygon], shape: tuple[int, int], offset: tu
     (x1, y1, x2, y2), patch = polygon_patch(polygons, shape, offset)
     mask = torch.zeros(shape, dtype=torch.bool, device=device)
     # Non-blocking: the driver stages a small pageable source before returning, without waiting for queued kernels.
-    mask[y1:y2, x1:x2] = torch.from_numpy(patch).to(device, non_blocking=True) > 0
+    mask[y1:y2, x1:x2] = _numpy_to_device(patch, device, non_blocking=True) > 0
     return mask
 
 

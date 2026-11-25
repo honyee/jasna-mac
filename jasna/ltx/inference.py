@@ -14,7 +14,16 @@ from pathlib import Path
 import torch
 
 from jasna._frozen import is_frozen
-from jasna.accelerator import amd_windows_budget_cap, device_free_bytes, load_gpu_libraries_ahead
+from jasna.accelerator import (
+    amd_windows_budget_cap,
+    device_free_bytes,
+    empty_cache,
+    load_gpu_libraries_ahead,
+    max_memory_allocated,
+    memory_allocated,
+    reset_peak_memory_stats,
+    synchronize,
+)
 from jasna.ltx.host_tensors import zero_tensors
 from jasna.ltx.model_files import LtxModelFiles, PlaceholderTensors
 from jasna.ltx.sampler import LtxTransformer, TransformerSource
@@ -232,7 +241,7 @@ class ModelRuntime:
             if self.protected:
                 self.request("unload_encoder", {}, [])
             else:
-                torch.cuda.empty_cache()
+                empty_cache(self.device)
 
     def prepare_transformer(self) -> None:
         """Open the transformer file and read its host-side part (in the worker when protected) while
@@ -271,7 +280,7 @@ class ModelRuntime:
     def _free_bytes_for_worker(self) -> int:
         """Device-wide free VRAM once this process's allocator has handed back its cached blocks
         (an encode pass's window pixels): only this process could reuse them, not the worker."""
-        torch.cuda.empty_cache()
+        empty_cache(self.device)
         return device_free_bytes(self.device)
 
     def unload_transformer(self) -> None:
@@ -282,7 +291,7 @@ class ModelRuntime:
             else:
                 model.close()
                 del model
-                torch.cuda.empty_cache()
+                empty_cache(self.device)
 
     def load_decoder(self):
         self._wait_ahead()
@@ -301,7 +310,7 @@ class ModelRuntime:
             if self.protected:
                 self.request("unload_decoder", {}, [])
             else:
-                torch.cuda.empty_cache()
+                empty_cache(self.device)
 
     def close(self) -> None:
         """Waits for a start begun by ``start_ahead`` first; its failure is only logged, since
@@ -329,7 +338,13 @@ class ModelRuntime:
     def peak_vram_bytes(self) -> tuple[int, int | None]:
         """This process's peak and the worker's (``None`` without one). They are kept apart:
         the two peaks need not happen at the same time, so their sum overstates the use."""
-        parent_peak = torch.cuda.max_memory_allocated(self.device)
+        if self.device.type == "mps":
+            parent_peak = max_memory_allocated(self.device)
+        else:
+            try:
+                parent_peak = torch.cuda.max_memory_allocated(self.device)
+            except (AssertionError, RuntimeError, ValueError):
+                parent_peak = 0
         if self.protected and self._client is not None:
             stats, _ = self.request("stats", {}, [])
             return parent_peak, stats["peak_vram_bytes"]
@@ -341,6 +356,8 @@ def free_vram_beside_parent(device: torch.device, parent_free_bytes: int) -> Cal
     before loading: on Windows the worker's CUDA view misses every other process's memory (the
     parent's included), so that gap is subtracted from it from then on. On Windows AMD the worker's
     own Windows budget caps it too (``accelerator.amd_windows_budget_cap``)."""
+    if device.type == "mps":
+        return device_free_bytes
     hidden = max(0, torch.cuda.mem_get_info(device)[0] - parent_free_bytes)
     return lambda current: amd_windows_budget_cap(current, max(0, torch.cuda.mem_get_info(current)[0] - hidden))
 
@@ -372,12 +389,21 @@ class WorkerBackend:
             setattr(self, name, None)
             zero_tensors(model.state_dict().values())
             del model
-            torch.cuda.empty_cache()
+            empty_cache(self.device)
 
     @torch.inference_mode()
     def dispatch(self, op: str, params: dict, tensors: list[torch.Tensor], advance: Callable[[int], None]):
         if op == "stats":
             return {"peak_vram_bytes": self.peak_vram_bytes}, []
+        if self.device.type == "mps":
+            reset_peak_memory_stats(self.device)
+            native_before = self._native_vram_bytes()
+            result = self._run(op, params, tensors, advance)
+            self.peak_vram_bytes = max(self.peak_vram_bytes, operation_peak_vram_bytes(
+                max_memory_allocated(self.device), memory_allocated(self.device),
+                native_before, self._native_vram_bytes(),
+            ))
+            return result
         if torch.cuda.is_initialized():
             torch.cuda.reset_peak_memory_stats(self.device)
         native_before = self._native_vram_bytes()
@@ -415,14 +441,17 @@ class WorkerBackend:
             if self.transformer is not None:
                 self.transformer.close()
                 self.transformer = None
-                torch.cuda.empty_cache()
+                empty_cache(self.device)
         elif op == "denoise_chain":
             if self.transformer is None:
                 raise RuntimeError("LTX transformer is not loaded")
 
             def completed(count: int) -> None:
                 # The parent times progress on its CPU clock, outside this GPU process.
-                torch.cuda.synchronize(self.device)
+                if self.device.type == "mps":
+                    torch.mps.synchronize()
+                else:
+                    torch.cuda.synchronize(self.device)
                 advance(count)
 
             return {}, self.transformer.denoise_chain(tensors, params["seeds"], params["window_hop"], completed)
@@ -437,10 +466,10 @@ class WorkerBackend:
             frames = decoded_frames(self.decoder, tensors[0], params["seed"], params["free_bytes"], self.device).to("cpu")
             if params["free_bytes"] < GPU_WINDOWS_MIN_FREE_BYTES:
                 # the parent's next budget reading counts this cache as used
-                torch.cuda.empty_cache()
+                empty_cache(self.device)
             return {}, [frames]
         elif op == "empty_cache":
-            torch.cuda.empty_cache()
+            empty_cache(self.device)
         else:
             raise ValueError("unsupported LTX inference operation")
         return {}, []

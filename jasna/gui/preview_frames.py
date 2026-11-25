@@ -34,7 +34,7 @@ def gpu_frame_image(frame, size: tuple[int, int]) -> Image.Image:
     height, width = int(frame.shape[-2]), int(frame.shape[-1])
     target = (max(2, int(size[1])), max(2, int(size[0])))
     if target != (height, width):
-        resize_dtype = torch.float16 if frame.is_cuda else torch.float32
+        resize_dtype = torch.float16 if frame.device.type in ("cuda", "mps") else torch.float32
         frame = functional.interpolate(
             frame.unsqueeze(0).to(resize_dtype),
             size=target,

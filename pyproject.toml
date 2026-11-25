@@ -68,6 +68,14 @@ amd = [
   # LTX kernels: the same wheels carry prebuilt HIP backends (Linux and Windows).
   "comfy-kitchen==0.2.38",
 ]
+mac = [
+  # Apple Silicon (macOS Metal / MPS) support: PyTorch MPS + custom Metal shaders for LTX.
+  "torch>=2.10",
+  "torchvision>=0.25",
+  "rfdetr==1.8.3",
+  "transformers==5.1.0",
+  "scipy",
+]
 dev = [
   "nuitka>=2.4",
   "pytest",

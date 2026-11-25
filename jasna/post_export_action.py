@@ -46,7 +46,12 @@ def run_post_export_action(action: str, command: str = "") -> None:
         return
 
     if action == POST_EXPORT_ACTION_SHUTDOWN:
-        cmd = ["shutdown", "/s", "/t", "0"] if sys.platform == "win32" else ["systemctl", "poweroff"]
+        if sys.platform == "win32":
+            cmd = ["shutdown", "/s", "/t", "0"]
+        elif sys.platform == "darwin":
+            cmd = ["osascript", "-e", 'tell application "System Events" to shut down']
+        else:
+            cmd = ["systemctl", "poweroff"]
         subprocess.Popen(cmd, env=host_program_environment(), **subprocess_no_window_kwargs())
         return
 
