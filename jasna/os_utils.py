@@ -51,10 +51,17 @@ def _bundled_exe_filename(name: str) -> str:
 
 
 def _find_bundled_executable(name: str) -> Path | None:
+    exe = _bundled_exe_filename(name)
+    if name in {"ffmpeg", "ffprobe"}:
+        tools_dir = os.environ.get("JASNA_TOOLS_DIR", "").strip()
+        if tools_dir:
+            p = Path(tools_dir) / exe
+            if p.is_file():
+                return p
+
     if not is_frozen():
         return None
 
-    exe = _bundled_exe_filename(name)
     # Nuitka standalone has no _internal/ (a PyInstaller-ism); bundled tools sit at the
     # dist root next to the binary, alongside model_weights/ and assets/.
     base = Path(sys.executable).parent

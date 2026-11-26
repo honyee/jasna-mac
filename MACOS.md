@@ -63,9 +63,13 @@ jasna --input input.mp4 --output output.mp4 --restoration-model-name ltx-standar
 # Run unit + Apple Silicon MPS / LTX Metal GPU test suites
 pytest tests/test_macos_mps.py tests/test_ltx_mps_gpu.py
 
-# Build / rebuild the clickable macOS application bundle (Jasna.app)
+# Build / rebuild the lightweight dev macOS application bundle (Jasna.app)
 .venv/bin/python scripts/build_macos_app.py
 open Jasna.app
+
+# Build the self-contained, redistributable Apple Silicon .dmg installer (dist/Jasna-<version>-macos-arm64.dmg)
+.venv/bin/python scripts/build_macos_dmg.py
 ```
 
-`Jasna.app` compiles a native ARM64 Mach-O launcher linked against the local `.venv` Python.framework, bundles the multi-resolution `AppIcon.icns`, isolates its runtime config/caches under `.jasna_config/` and `.cache/` inside this directory, and supports moving/aliasing to `/Applications` or the Dock.
+- **Dev bundle (`scripts/build_macos_app.py`)**: Compiles a lightweight ARM64 Mach-O launcher linked against the local `.venv` Python.framework, isolating runtime config/caches under `.jasna_config/` and `.cache/` inside the repo.
+- **Standalone DMG (`scripts/build_macos_dmg.py`)**: Embeds Python 3.12 `Python.framework`, Tcl/Tk 9.1, relocated `ffmpeg`/`ffprobe` + all runtime dylibs inside `Contents/Frameworks/` (audited for zero `/opt/homebrew` references), pruned runtime `site-packages`, clean `jasna/` sources (excluding `jasna/protection`), and the 3 official open-source model weights; bottom-up ad-hoc signs every Mach-O binary and packages `Jasna.app` + `/Applications` symlink into a compressed UDZO `.dmg` with a `.sha256` checksum. At runtime, user config/logs/caches and writable `model_weights/` live in `~/Library/Application Support/Jasna/`.

@@ -125,6 +125,24 @@ def test_apple_vendor_capabilities() -> None:
     assert ltx_models.card_unavailable_reason(AcceleratorVendor.APPLE) is None
 
 
+def test_standalone_bundle_env_overrides(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from jasna.engine_paths import model_weights_dir
+    from jasna.os_utils import find_executable
+
+    weights_dir = tmp_path / "weights"
+    weights_dir.mkdir()
+    monkeypatch.setenv("JASNA_MODEL_WEIGHTS_DIR", str(weights_dir))
+    assert model_weights_dir() == weights_dir
+
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir()
+    fake_ffmpeg = tools_dir / "ffmpeg"
+    fake_ffmpeg.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_ffmpeg.chmod(0o755)
+    monkeypatch.setenv("JASNA_TOOLS_DIR", str(tools_dir))
+    assert find_executable("ffmpeg") == str(fake_ffmpeg)
+
+
 @pytest.mark.skipif(not has_mps(), reason="requires Apple Silicon MPS")
 class TestAppleSiliconMps:
     def test_accelerator_and_system_checks(self) -> None:

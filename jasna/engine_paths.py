@@ -15,10 +15,15 @@ logger = logging.getLogger(__name__)
 def model_weights_dir() -> Path:
     """Resolve the ``model_weights`` directory.
 
+    Honors ``JASNA_MODEL_WEIGHTS_DIR`` when set (used by standalone macOS ``.app``
+    bundles so writable weights and caches live in user Application Support).
     When running as a frozen executable, models are bundled next to the executable.
     In a dev / source checkout we fall back to a CWD-relative path so existing dev
     workflows keep working.
     """
+    override = os.environ.get("JASNA_MODEL_WEIGHTS_DIR", "").strip()
+    if override:
+        return Path(override)
     if is_frozen():
         return Path(sys.executable).parent / "model_weights"
     return Path("model_weights")

@@ -21,7 +21,7 @@ Jasna は動画と画像のモザイクを復元します。本フォークで�
 | **動画ハードウェアエンコード／デコード** | 動作済み | VideoToolbox ハードウェア **H.264**（NV12）および **10-bit HEVC**（P010、MPS の 10-bit 飽和問題を修正済み）、ソフトウェア **10-bit AV1**（`libsvtav1`）、さらに VideoToolbox ハードウェア支援デコードと自動フォールバックに対応。 |
 | **PyTorch MPS マルチスレッド安定化** | 修正・検証済み | マルチスレッド MPS デッドロック（GIL 安全な `_MpsEvent`、NumPy 転送時の `CompletionQueueDispatch` デッドロック回避、MPS での `wait_stream` 排除）および `torch.mps.empty_cache()` の `MPSGraphCache::clear()` 起因の解放後使用クラッシュを `mps_concurrent_scope` で解消。MPS のフェザーぼかしも分離型 `conv2d` 化により約 4 倍高速化（数値一致）。 |
 | **リアルタイム GPU / VRAM モニター** | 動作済み | macOS `IOKit`（`IOAccelerator` / `PerformanceStatistics`）をプロセス内から直接読み取り（`sudo` 不要）、GUI 下部に Apple Silicon のリアルタイム GPU 使用率と VRAM 使用率を表示（[`jasna/gui/system_stats.py`](jasna/gui/system_stats.py)）。 |
-| **ネイティブ macOS アプリ（`Jasna.app`）** | 動作済み | [`scripts/build_macos_app.py`](scripts/build_macos_app.py) により ARM64 Mach-O ランチャーとマルチ解像度 `AppIcon.icns` を生成。ローカル分離設定・キャッシュ、macOS フォント、Homebrew `ffmpeg` 自動検出、macOS 右クリック貼り付け・`⌘+A` 全選択に対応。 |
+| **単体 `.dmg` インストーラー & ネイティブアプリ** | 動作済み | Python 3.12、Tcl/Tk 9.1、PyTorch MPS、`ffmpeg`/`ffprobe`、公式オープンソース重みを同梱した Apple Silicon 向け単体インストーラー（`Jasna-0.12.4-macos-arm64.dmg`、[Releases](https://github.com/honyee/jasna-mac/releases) / [`scripts/build_macos_dmg.py`](scripts/build_macos_dmg.py)）および開発用軽量バンドル（[`scripts/build_macos_app.py`](scripts/build_macos_app.py)）。 |
 | **オープンソース超解像モデル** | 動作済み | `SPAN` および `RealPLKSR` が MPS 上で動作。 |
 
 ### 現在の制限と未対応項目
@@ -38,6 +38,21 @@ Jasna は動画と画像のモザイクを復元します。本フォークで�
 
 ### macOS クイックスタート
 
+#### 方法 1: `.dmg` インストーラーから導入（推奨・Python / Homebrew 不要）
+
+1. [GitHub Releases](https://github.com/honyee/jasna-mac/releases) から **`Jasna-0.12.4-macos-arm64.dmg`** をダウンロードします。
+2. `.dmg` を開き、**`Jasna.app`** を **`Applications`** フォルダーにドラッグ＆ドロップします。
+3. コミュニティビルドは ad-hoc 署名（Apple 公証なし）のため、初回起動前にターミナルで一度だけ検疫属性を解除してください：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Jasna.app
+open /Applications/Jasna.app
+```
+
+> 設定・ログ・キャッシュおよび書き込み可能な `model_weights/` は `~/Library/Application Support/Jasna/` に保存されます。`ffmpeg`/`ffprobe` と 3 つの公式オープンソース重み（BasicVSR++、Lada YOLO v4、Jasna RF-DETR v6）が同梱されているため、導入後すぐに利用できます。
+
+#### 方法 2: ソースから実行・ビルド
+
 ```bash
 # 1. 事前準備：Apple Silicon Mac（macOS 14 以降）、Python 3.12+、FFmpeg
 brew install python@3.12 ffmpeg
@@ -49,12 +64,14 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[mac,dev]"
 
-# 3. クリックで起動できるネイティブアプリ Jasna.app をビルドして起動
+# 3. 開発用ネイティブアプリ Jasna.app をビルドして起動（または単体 DMG を作成）
 .venv/bin/python scripts/build_macos_app.py
 open Jasna.app
+# 任意：dist/ に再配布可能な単体 .dmg をビルド
+# .venv/bin/python scripts/build_macos_dmg.py
 
-# 4. macOS MPS / LTX Metal GPU テストスイートを実行
-.venv/bin/pytest -v tests/test_macos_mps.py tests/test_ltx_mps_gpu.py
+# 4. macOS MPS / LTX Metal / システム統計テストスイートを実行
+.venv/bin/pytest -v tests/test_macos_mps.py tests/test_ltx_mps_gpu.py tests/test_system_stats.py
 ```
 
 詳細な Metal カーネル設計・並行処理修正・実測ベンチマークは **[MACOS.md](MACOS.md)** をご参照ください。

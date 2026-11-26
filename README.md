@@ -23,7 +23,7 @@ Jasna restores mosaics in videos and images. This fork brings native **macOS App
 | **Video Encode / Decode** | Working | Hardware **H.264** (`h264_videotoolbox`, NV12) and **10-bit HEVC** (`hevc_videotoolbox`, P010), software **10-bit AV1** (`libsvtav1`), plus VideoToolbox hardware-assisted decode with automatic fallback. |
 | **PyTorch MPS Concurrency Stability** | Fixed & Tested | Resolved multi-threaded MPS deadlocks (GIL-safe `_MpsEvent`, NumPy buffer staging, no MPS `wait_stream`) and `torch.mps.empty_cache()` / `MPSGraphCache::clear()` use-after-free crashes via `mps_concurrent_scope`; ~4x faster bit-exact separable `conv2d` feather blur on MPS. |
 | **Live GPU / VRAM Monitor** | Working | In-process macOS `IOKit` (`IOAccelerator` / `PerformanceStatistics`) polling (~0.2 ms, no `sudo`) shows live Apple Silicon GPU & VRAM utilization in the bottom status bar ([`jasna/gui/system_stats.py`](jasna/gui/system_stats.py)). |
-| **Clickable macOS App (`Jasna.app`)** | Working | Native ARM64 Mach-O launcher ([`scripts/build_macos_app.py`](scripts/build_macos_app.py)), multi-res `AppIcon.icns`, isolated `.jasna_config`/`.cache`, native macOS UI/CJK fonts, Homebrew `ffmpeg`/`ffprobe` detection, macOS right-click & `Cmd+A` entry bindings. |
+| **Standalone macOS Installer (`.dmg`) & App** | Working | Self-contained Apple Silicon installer (`Jasna-0.12.4-macos-arm64.dmg`, [Releases](https://github.com/honyee/jasna-mac/releases)) bundling Python 3.12, Tcl/Tk 9.1, PyTorch MPS, `ffmpeg`/`ffprobe`, and open-source weights ([`scripts/build_macos_dmg.py`](scripts/build_macos_dmg.py)), plus lightweight dev launcher ([`scripts/build_macos_app.py`](scripts/build_macos_app.py)). |
 | **Open-Source Upscalers** | Working | `SPAN` and `RealPLKSR` supported on MPS. |
 
 ### Current Limitations & Known Gaps
@@ -40,6 +40,21 @@ Jasna restores mosaics in videos and images. This fork brings native **macOS App
 
 ### macOS Quick Start
 
+#### Option 1: Install from `.dmg` (Recommended — No Python or Homebrew Required)
+
+1. Download **`Jasna-0.12.4-macos-arm64.dmg`** from [GitHub Releases](https://github.com/honyee/jasna-mac/releases).
+2. Open the `.dmg` and drag **`Jasna.app`** into **`Applications`**.
+3. Because this community build is ad-hoc signed (not Apple Developer notarized), clear the macOS Gatekeeper quarantine attribute once before opening:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Jasna.app
+open /Applications/Jasna.app
+```
+
+> All runtime config, caches, and writable `model_weights/` are stored under `~/Library/Application Support/Jasna/`. The 3 official open-source weights (BasicVSR++, Lada YOLO v4, Jasna RF-DETR v6) and `ffmpeg`/`ffprobe` are bundled and ready out of the box.
+
+#### Option 2: Run or Build from Source
+
 ```bash
 # 1. Prerequisites: Apple Silicon Mac (macOS 14+), Python 3.12+, FFmpeg
 brew install python@3.12 ffmpeg
@@ -51,12 +66,14 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[mac,dev]"
 
-# 3. Build and launch the native macOS app
+# 3. Build and launch lightweight dev Jasna.app (or build standalone DMG)
 .venv/bin/python scripts/build_macos_app.py
 open Jasna.app
+# Optional: package a self-contained redistributable DMG into dist/
+# .venv/bin/python scripts/build_macos_dmg.py
 
-# 4. Run macOS MPS & LTX Metal GPU test suites (27 tests)
-.venv/bin/pytest -v tests/test_macos_mps.py tests/test_ltx_mps_gpu.py
+# 4. Run macOS MPS & LTX Metal GPU test suites
+.venv/bin/pytest -v tests/test_macos_mps.py tests/test_ltx_mps_gpu.py tests/test_system_stats.py
 ```
 
 For full technical details, Metal kernel notes, and benchmark tables, see **[MACOS.md](MACOS.md)**.

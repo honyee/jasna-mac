@@ -21,7 +21,7 @@ Jasna 用于修复视频和图片中的马赛克。本移植分支为 **macOS Ap
 | **视频硬件编解码** | 已完成 | 支持 VideoToolbox 硬件 **H.264**（NV12）与 **10-bit HEVC**（P010，已修复 MPS 10-bit 饱和截断）、**10-bit AV1**（`libsvtav1`）编码，以及 VideoToolbox 硬件辅助解码与自动软解回退。 |
 | **PyTorch MPS 多线程稳定性** | 已修复并通过压测 | 彻底修复 PyTorch MPS 多线程死锁（GIL 安全 `_MpsEvent`、NumPy 上传防 `CompletionQueueDispatch` 互锁、移除 MPS `wait_stream`）以及 `torch.mps.empty_cache()` 触发 `MPSGraphCache::clear()` 导致的释放后使用崩溃（`mps_concurrent_scope` 延迟清理）；MPS 羽化模糊改用可分离 `conv2d` 提速约 4 倍且精度无损。 |
 | **实时 GPU / VRAM 监控** | 已完成 | 进程内直接读取 macOS `IOKit`（`IOAccelerator` / `PerformanceStatistics`，约 0.2 ms、无需 `sudo`），在界面底部实时显示 Apple Silicon GPU 与显存占用率（[`jasna/gui/system_stats.py`](jasna/gui/system_stats.py)）。 |
-| **原生双击应用（`Jasna.app`）** | 已完成 | 通过 [`scripts/build_macos_app.py`](scripts/build_macos_app.py) 编译原生 ARM64 Mach-O 启动器、多分辨率 `AppIcon.icns`、本地隔离配置与缓存、macOS 字体（`PingFang SC` / `Helvetica Neue` / `Menlo`）、Homebrew `ffmpeg` 自动发现，以及 macOS 右键粘贴与 `⌘+A` 全选适配。 |
+| **独立 `.dmg` 安装包与原生应用** | 已完成 | 提供开箱即用的 Apple Silicon 独立安装包（`Jasna-0.12.4-macos-arm64.dmg`，见 [Releases](https://github.com/honyee/jasna-mac/releases)），内置 Python 3.12、Tcl/Tk 9.1、PyTorch MPS、`ffmpeg`/`ffprobe` 与官方开源权重（[`scripts/build_macos_dmg.py`](scripts/build_macos_dmg.py)），同时保留轻量开发版 [`scripts/build_macos_app.py`](scripts/build_macos_app.py)。 |
 | **开源超分模型** | 已完成 | 支持 `SPAN` 与 `RealPLKSR` 在 MPS 上运行。 |
 
 ### 当前限制与尚未支持的部分
@@ -38,6 +38,21 @@ Jasna 用于修复视频和图片中的马赛克。本移植分支为 **macOS Ap
 
 ### macOS 快速开始
 
+#### 方式一：直接下载 `.dmg` 安装包（推荐，无需安装 Python 或 Homebrew）
+
+1. 前往 [GitHub Releases](https://github.com/honyee/jasna-mac/releases) 下载 **`Jasna-0.12.4-macos-arm64.dmg`**。
+2. 双击打开 `.dmg`，将 **`Jasna.app`** 拖入 **`Applications`（应用程序）** 文件夹。
+3. 由于社区移植版使用本地 ad-hoc 签名（未经 Apple 开发者公证），首次打开前请在终端执行一次以下命令以解除 Gatekeeper 隔离提示：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Jasna.app
+open /Applications/Jasna.app
+```
+
+> 应用的配置、日志、缓存与可写 `model_weights/` 均位于 `~/Library/Application Support/Jasna/`；安装包已内置 `ffmpeg`/`ffprobe` 与 3 个官方开源权重（BasicVSR++、Lada YOLO v4、Jasna RF-DETR v6），拖入即可直接使用。
+
+#### 方式二：从源码运行或自行打包
+
 ```bash
 # 1. 环境准备：Apple Silicon Mac（macOS 14+）、Python 3.12+、FFmpeg
 brew install python@3.12 ffmpeg
@@ -49,12 +64,14 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[mac,dev]"
 
-# 3. 编译并启动可双击打开的原生应用 Jasna.app
+# 3. 编译并启动开发版原生应用 Jasna.app（或打包独立 DMG）
 .venv/bin/python scripts/build_macos_app.py
 open Jasna.app
+# 可选：在 dist/ 中构建完整独立可分发的 .dmg 安装包
+# .venv/bin/python scripts/build_macos_dmg.py
 
-# 4. 运行 macOS MPS 与 LTX Metal GPU 测试套（27 项）
-.venv/bin/pytest -v tests/test_macos_mps.py tests/test_ltx_mps_gpu.py
+# 4. 运行 macOS MPS、LTX Metal 与状态监控测试套
+.venv/bin/pytest -v tests/test_macos_mps.py tests/test_ltx_mps_gpu.py tests/test_system_stats.py
 ```
 
 更完整的 Metal 内核设计、并发修复细节与实测基准数据，请参阅 **[MACOS.md](MACOS.md)**。
