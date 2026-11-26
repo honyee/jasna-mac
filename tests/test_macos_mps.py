@@ -163,6 +163,11 @@ class TestAppleSiliconMps:
         vendor, blackwell, fg = system_checks.warm_up_cuda()
         assert vendor is AcceleratorVendor.APPLE and blackwell is False and fg is False
 
+        from jasna.gui.system_stats import read_gpu_vram
+        gpu_pct, vram_pct = read_gpu_vram()
+        assert gpu_pct is not None and 0 <= gpu_pct <= 100
+        assert vram_pct is not None and 0 <= vram_pct <= 100
+
     def test_yuv_p010_and_nv12_parity(self) -> None:
         from av.video.reformatter import Colorspace as AvColorspace
 

@@ -32,6 +32,7 @@ pip install -e ".[mac,dev]"
 - **LTX Diffusion VAE (`jasna/models/ltx_vae/na_mps.py`)**:
   - Custom 4-W-query tiled Metal Flash 3D Neighborhood Attention (`na3d_hd64_{bf16,fp16}_w4`) using SIMD group reductions and `fast::exp2` with zero mask materialization.
   - Runs in FP16 (`half_dtype(mps) == torch.float16`, with FP32 encoder tail) and keeps `VideoEncoder` `Conv3d` in contiguous NCDHW format (~2.5x faster than `channels_last_3d` on MPS).
+- **Live GPU & VRAM Monitoring (`jasna/gui/system_stats.py`)**: Reads Apple Silicon `IOAccelerator` `PerformanceStatistics` (`Device Utilization %` and `In use system memory`) directly in-process via `IOKit.framework` / `CoreFoundation.framework` (~0.2 ms per poll, zero subprocesses, no `sudo`).
 - **Video Codecs (`jasna/media/`)**:
   - Hardware H.264 (`h264_videotoolbox`, NV12) and 10-bit HEVC (`hevc_videotoolbox`, P010) via Apple VideoToolbox with `global_quality` + `qscale`.
   - 10-bit AV1 via `libsvtav1` (`yuv420p10le`).

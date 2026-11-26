@@ -1,8 +1,67 @@
+> **macOS Apple Silicon 移植版（`jasna-mac`）**：本リポジトリは、上流の [Kruk2/jasna](https://github.com/Kruk2/jasna)（`v0.12.4`、AGPL-3.0）をベースにしたコミュニティ版 macOS（Apple Silicon / Metal MPS）移植プロジェクトです。現在の対応状況と既知の制限は下記の[macOS Apple Silicon 移植状況](#macos-apple-silicon-移植状況)、技術詳細とベンチマークは [MACOS.md](MACOS.md) をご覧ください。
+>
 > **支援者向けモデルの正規ライセンスコードを入手できるのは、[Ko-fi](https://ko-fi.com/kruk2)、[Unifans](https://app.unifans.io/c/kruk2)、中国では[中国語版 README](README.zh.md#在闲鱼购买) の販売者だけです。**
 
 [English](README.md) | [**日本語**](README.ja.md) | [中文](README.zh.md)
 
-# <img width="32" src="https://github.com/Kruk2/jasna/blob/main/assets/jasna-logo.png?raw=true" /> Jasna 
+# <img width="32" src="https://github.com/Kruk2/jasna/blob/main/assets/jasna-logo.png?raw=true" /> Jasna（macOS Apple Silicon 移植版）
+
+Jasna は動画と画像のモザイクを復元します。本フォークでは **macOS Apple Silicon（M1/M2/M3/M4、Metal / MPS）** へのネイティブ対応、**LTX-2.5 22B モデルおよび Diffusion VAE 向けカスタム Metal シェーダー**、**Apple VideoToolbox** によるハードウェア動画エンコード／デコード、さらにダブルクリックで起動できるネイティブ **`Jasna.app`** アプリバンドルを追加しています。
+
+## macOS Apple Silicon 移植状況
+
+### 現在動作する機能（Apple M2 Max / 32 GiB ユニファイドメモリで検証済み）
+
+| モジュール | 状態 | 詳細 |
+| --- | --- | --- |
+| **Apple Silicon MPS バックエンド** | 動作済み | `AcceleratorVendor.APPLE` / `KernelBackend.APPLE_MPS` のデバイス・メモリ・ストリーム・イベント抽象化（[`jasna/accelerator.py`](jasna/accelerator.py)）。 |
+| **モザイク検出** | 動作済み | **RF-DETR**（`rfdetr-v6-large`）および **YOLO**（`lada-yolo-v4`）が MPS 上でネイティブ動作。 |
+| **BasicVSR++ 動画復元（オープンソース）** | 動作済み（実復元出力） | MPS 上で `deform_conv2d` を含め完全動作し、GUI / CLI の両方ですぐに実際のモザイク除去結果を出力可能（1080p 300 フレーム RF-DETR + BasicVSR++ で約 35.6 秒）。 |
+| **LTX-2.5 22B Transformer + Diffusion VAE** | 動作済み（お試し／平文モデルのみ） | 独自の W8A16 ConvRot Metal シェーダー（[`jasna/ltx/mps_kernels.py`](jasna/ltx/mps_kernels.py)、FP16 演算 + BF16 残差ストリーム）と 4-W タイル分割 Metal Flash-NA3D（[`jasna/models/ltx_vae/na_mps.py`](jasna/models/ltx_vae/na_mps.py)）を実装。1080p 121 フレームの 4 パス全体を **58.2 秒**で完了（48/48 ブロック常駐、`34.7 s/step`、ピーク MPS メモリ **12.42 GiB**）。 |
+| **動画ハードウェアエンコード／デコード** | 動作済み | VideoToolbox ハードウェア **H.264**（NV12）および **10-bit HEVC**（P010、MPS の 10-bit 飽和問題を修正済み）、ソフトウェア **10-bit AV1**（`libsvtav1`）、さらに VideoToolbox ハードウェア支援デコードと自動フォールバックに対応。 |
+| **PyTorch MPS マルチスレッド安定化** | 修正・検証済み | マルチスレッド MPS デッドロック（GIL 安全な `_MpsEvent`、NumPy 転送時の `CompletionQueueDispatch` デッドロック回避、MPS での `wait_stream` 排除）および `torch.mps.empty_cache()` の `MPSGraphCache::clear()` 起因の解放後使用クラッシュを `mps_concurrent_scope` で解消。MPS のフェザーぼかしも分離型 `conv2d` 化により約 4 倍高速化（数値一致）。 |
+| **リアルタイム GPU / VRAM モニター** | 動作済み | macOS `IOKit`（`IOAccelerator` / `PerformanceStatistics`）をプロセス内から直接読み取り（`sudo` 不要）、GUI 下部に Apple Silicon のリアルタイム GPU 使用率と VRAM 使用率を表示（[`jasna/gui/system_stats.py`](jasna/gui/system_stats.py)）。 |
+| **ネイティブ macOS アプリ（`Jasna.app`）** | 動作済み | [`scripts/build_macos_app.py`](scripts/build_macos_app.py) により ARM64 Mach-O ランチャーとマルチ解像度 `AppIcon.icns` を生成。ローカル分離設定・キャッシュ、macOS フォント、Homebrew `ffmpeg` 自動検出、macOS 右クリック貼り付け・`⌘+A` 全選択に対応。 |
+| **オープンソース超解像モデル** | 動作済み | `SPAN` および `RealPLKSR` が MPS 上で動作。 |
+
+### 現在の制限と未対応項目
+
+- **クローズドソースの支援者向けモデルおよびライセンス認証（`jasna.protection`）は macOS 非対応**：
+  - 公式配布の暗号化重みファイル（`.safetensors.enc`：**LTX 正式復元モデル**、**UNet 4x**、**SD 1.5**）およびオンライン／オフライン認証は、上流作者の非公開モジュール `jasna.protection` に依存しています。現在公式リリースは Windows / Linux x86-64 版のみで、macOS ARM64 版は提供されていません。
+  - そのため、本オープンソース macOS 版では以下の挙動になります：
+    - 「**Jasna を有効化**」ダイアログでは、上流の公開ソース仕様に従いライセンス入力欄とボタンが意図的に無効化（`protection_available() == False`）されます。
+    - **LTX はお試しモード（速度・互換性テスト）として動作**します。ランダムなプレースホルダー重みを使用するため、モザイク領域は実際の復元映像ではなく灰色の霧がかかったように表示されます（正規の平文 `.safetensors` 重みを別途用意した場合のみ実復元が可能）。
+    - **公式から macOS 版リリースが提供される前に、Mac ローカル利用目的でライセンスコードを購入しないようご注意ください。**
+  - 現時点で Mac ローカルで実際のモザイク復元を行う場合は、オープンソースの **BasicVSR++**（および必要に応じて `SPAN` / `RealPLKSR`）をご利用ください。
+- **NVIDIA 専用機能は非対応**：TensorRT、NVDEC/VALI、NVENC、NVFP4、RTX Super Res、DLSS 5、フレーム生成、Topaz TVAI は macOS では利用できません。
+- **実機検証範囲**：Apple M2 Max（32 GiB ユニファイドメモリ）でエンドツーエンド検証済みです。16 GiB 搭載 Mac 向けには LTX ブロックの自動ストリーミングを備えていますが、16 GiB 実機での長時間ベンチマークは未実施です。
+
+### macOS クイックスタート
+
+```bash
+# 1. 事前準備：Apple Silicon Mac（macOS 14 以降）、Python 3.12+、FFmpeg
+brew install python@3.12 ffmpeg
+
+# 2. リポジトリを取得して macOS 向け依存パッケージをインストール
+git clone https://github.com/honyee/jasna-mac.git
+cd jasna-mac
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[mac,dev]"
+
+# 3. クリックで起動できるネイティブアプリ Jasna.app をビルドして起動
+.venv/bin/python scripts/build_macos_app.py
+open Jasna.app
+
+# 4. macOS MPS / LTX Metal GPU テストスイートを実行
+.venv/bin/pytest -v tests/test_macos_mps.py tests/test_ltx_mps_gpu.py
+```
+
+詳細な Metal カーネル設計・並行処理修正・実測ベンチマークは **[MACOS.md](MACOS.md)** をご参照ください。
+
+---
+
+## 上流 Jasna の説明
 
 Jasna は動画と画像のモザイクを復元します。無料で、シンプルなアプリと
 コマンドラインがあり、GPU で動きます。

@@ -20,6 +20,7 @@ Jasna 用于修复视频和图片中的马赛克。本移植分支为 **macOS Ap
 | **LTX-2.5 22B + Diffusion VAE** | 已完成（试用/明文权重） | 自研 W8A16 ConvRot Metal 着色器（[`jasna/ltx/mps_kernels.py`](jasna/ltx/mps_kernels.py)，FP16 计算 + BF16 残差流）与 4-W 分块 Metal Flash-NA3D（[`jasna/models/ltx_vae/na_mps.py`](jasna/models/ltx_vae/na_mps.py)）。1080p 121 帧完整 4 阶段实测 **58.2 秒**（48/48 块全常驻显存、`34.7 s/step`、峰值 MPS 内存 **12.42 GiB**）。 |
 | **视频硬件编解码** | 已完成 | 支持 VideoToolbox 硬件 **H.264**（NV12）与 **10-bit HEVC**（P010，已修复 MPS 10-bit 饱和截断）、**10-bit AV1**（`libsvtav1`）编码，以及 VideoToolbox 硬件辅助解码与自动软解回退。 |
 | **PyTorch MPS 多线程稳定性** | 已修复并通过压测 | 彻底修复 PyTorch MPS 多线程死锁（GIL 安全 `_MpsEvent`、NumPy 上传防 `CompletionQueueDispatch` 互锁、移除 MPS `wait_stream`）以及 `torch.mps.empty_cache()` 触发 `MPSGraphCache::clear()` 导致的释放后使用崩溃（`mps_concurrent_scope` 延迟清理）；MPS 羽化模糊改用可分离 `conv2d` 提速约 4 倍且精度无损。 |
+| **实时 GPU / VRAM 监控** | 已完成 | 进程内直接读取 macOS `IOKit`（`IOAccelerator` / `PerformanceStatistics`，约 0.2 ms、无需 `sudo`），在界面底部实时显示 Apple Silicon GPU 与显存占用率（[`jasna/gui/system_stats.py`](jasna/gui/system_stats.py)）。 |
 | **原生双击应用（`Jasna.app`）** | 已完成 | 通过 [`scripts/build_macos_app.py`](scripts/build_macos_app.py) 编译原生 ARM64 Mach-O 启动器、多分辨率 `AppIcon.icns`、本地隔离配置与缓存、macOS 字体（`PingFang SC` / `Helvetica Neue` / `Menlo`）、Homebrew `ffmpeg` 自动发现，以及 macOS 右键粘贴与 `⌘+A` 全选适配。 |
 | **开源超分模型** | 已完成 | 支持 `SPAN` 与 `RealPLKSR` 在 MPS 上运行。 |
 

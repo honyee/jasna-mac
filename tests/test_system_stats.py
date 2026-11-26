@@ -46,6 +46,7 @@ def test_read_gpu_vram_returns_none_when_gpu_tools_and_amd_sysfs_are_missing(
 ) -> None:
     monkeypatch.setattr(system_stats.os_utils, "find_executable", lambda name: None)
     monkeypatch.setattr(system_stats, "_DRM_CLASS_PATH", tmp_path)
+    monkeypatch.setattr(system_stats, "_read_apple_mps", lambda: (None, None))
 
     def _should_not_run(*args, **kwargs):
         raise AssertionError("subprocess.run should not be called when nvidia-smi is missing")
@@ -55,6 +56,15 @@ def test_read_gpu_vram_returns_none_when_gpu_tools_and_amd_sysfs_are_missing(
     gpu, vram = system_stats.read_gpu_vram()
     assert gpu is None
     assert vram is None
+
+
+def test_read_apple_mps_combines_iokit_gpu_util_and_memory(monkeypatch) -> None:
+    monkeypatch.setattr(system_stats, "_read_apple_iokit_stats", lambda: (68, 8 << 30))
+    monkeypatch.setattr(system_stats, "_apple_gpu_total_memory", lambda: 24 << 30)
+
+    gpu, vram = system_stats._read_apple_mps()
+    assert gpu == 68
+    assert vram == 33
 
 
 def test_read_gpu_vram_reads_amd_sysfs_without_torch(monkeypatch, tmp_path) -> None:
